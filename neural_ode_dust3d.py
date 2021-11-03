@@ -87,6 +87,7 @@ def get_ray_ode(log_rho_fn, dx_dt):
         1,
         name='ds_dt'
     )
+    #tf.print(ds_dt)
     def ode(t, y):
         """
         t = fractional distance along ray
@@ -143,8 +144,8 @@ def plot_lnrho_A(lnrho_img, x_star, A_star, title='', diff=False):
             label = r'$A$'
 
         sc = ax.scatter(
-            x_star.numpy()[:,0],
-            x_star.numpy()[:,1],
+            x_star[:,0],
+            x_star[:,1],
             c=A_star,
             s=16 / max(np.sqrt(n_stars/1024), 1),
             cmap='coolwarm',
@@ -173,32 +174,31 @@ def plot_lnrho_A(lnrho_img, x_star, A_star, title='', diff=False):
     return fig
 
 
-def train(log_rho_fit, x_star, A_true, n_steps, callback=None):
-    #prior_weight = tf.constant(1e-2)
+def train(log_rho_fit, dataset,
+          n_stars, batch_size, n_epochs,
+          callback=None):
+    # Break the dataset up into batches
+    dataset_batches = dataset.shuffle(
+                          buffer_size=16*batch_size
+                      ).batch(batch_size).repeat(n_epochs)
 
+    # Calculate the number of steps from the given
+    # dataset size and requested # of epochs
+    n_steps = n_stars * n_epochs
+
+    # Smoothly increase the weight given to the prior during training
     def get_prior_weight(step):
         log_w0, log_w1 = -2, -1 # base 10
         log_w = log_w0 + step/n_steps * (log_w1-log_w0)
         return tf.constant(10**log_w)
 
-    n_stars = x_star.shape[0]
-
-    ode_fn = get_ray_ode(log_rho_fit, x_star)
+    # ODE solver
     solver = tfp.math.ode.DormandPrince(
         rtol=1e-3, atol=1e-3, name='ray_integrator'
     )
 
-    # opt = tfa.optimizers.RectifiedAdam(
-    #     lr=1e-3,
-    #     min_lr=1e-4,
-    #     total_steps=n_steps,
-    #     warmup_proportion=0.1,
-    #     epsilon=1e-5 # Increase stability at late times
-    # )
-    # opt = keras.optimizers.Adadelta(learning_rate=1e-3)
-    #lr_values = [1e-3, 1e-4, 1e-5, 1e-6]
+    # Optimizer, with step-function learning rate
     lr_values = [1e-3, 1e-4, 1e-5]
-    #lr_values = [1e-4, 1e-5]
     n = len(lr_values)
     lr_boundaries = [int((k+1)*n_steps/n) for k in range(n-1)]
     lr_schedule = keras.optimizers.schedules.PiecewiseConstantDecay(
@@ -206,21 +206,39 @@ def train(log_rho_fit, x_star, A_true, n_steps, callback=None):
     )
     opt = keras.optimizers.SGD(learning_rate=lr_schedule, momentum=0.5)
 
+    def ode(t, y, dx_dt, ds_dt):
+        """
+        t = fractional distance along ray
+        y = (\int \exp(\rho) ds, *x)
+        """
+        A,x = tf.split(y, [1,2], axis=1)
+        dy_dt = tf.concat([ds_dt*tf.math.exp(log_rho_fit(x)), dx_dt], 1)
+        return dy_dt
+
+    # Function that takes one gradient step
     @tf.function
-    def grad_step(prior_weight):
+    def grad_step(A_obs, x_star, prior_weight):
         print('Tracing <grad_step()> ...')
+
+        #ode_fn = get_ray_ode(log_rho_fit, x_star)
+        ds_dt = tf.expand_dims(
+            tf.norm(x_star, axis=1),
+            1,
+            name='ds_dt'
+        )
 
         with tf.GradientTape() as g:
             print('Solving ODE ...')
             res = solver.solve(
-                ode_fn,
-                0, tf.zeros([n_stars,3]),
-                tf.constant([1])
+                ode,
+                0, tf.zeros([batch_size,3]),
+                tf.constant([1]),
+                constants={'dx_dt':x_star,'ds_dt':ds_dt}
             )
             print('Calculating chi^2 ...')
             A_fit,_ = tf.split(res.states, [1,2], axis=2)
             A_fit = tf.squeeze(A_fit)
-            log_chi2 = tf.math.log(tf.reduce_mean((A_true - A_fit)**2))
+            log_chi2 = tf.math.log(tf.reduce_mean((A_obs - A_fit)**2))
             prior = log_rho_fit.prior(3.0)
             loss = log_chi2 + prior_weight * prior
 
@@ -237,10 +255,11 @@ def train(log_rho_fit, x_star, A_true, n_steps, callback=None):
     ln_chi2_hist = []
     prior_hist = []
 
-    step_iter = tqdm(range(n_steps))
-    for i in step_iter:
+    n_steps = (n_stars // batch_size) * n_epochs
+    step_iter = tqdm(enumerate(dataset_batches), total=n_steps)
+    for i,(A_obs,x_star) in step_iter:
         prior_weight = get_prior_weight(i)
-        loss, A_fit, ln_chi2, prior = grad_step(prior_weight)
+        loss, A_fit, ln_chi2, prior = grad_step(A_obs, x_star, prior_weight)
 
         loss_hist.append(loss)
         ln_chi2_hist.append(ln_chi2)
@@ -261,10 +280,9 @@ def gen_mock_data(max_order, n_stars, sigma_A=0, k_slope=4):
     log_rho = HarmonicExpansion2D(max_order, extent=[10,10], k_slope=k_slope)
 
     rng = np.random.default_rng()
-    x_star = tf.constant(rng.uniform(-8, 8, size=(n_stars,2)).astype('f4'))
+    x_star = rng.uniform(-8, 8, size=(n_stars,2)).astype('f4')
 
     A = calc_A(log_rho, x_star)
-    
     A_obs = A + sigma_A * rng.normal(size=A.shape)
 
     return log_rho, x_star, A, A_obs
@@ -318,19 +336,26 @@ def plot_loss(loss_hist, ln_chi2_hist, prior_hist):
 
     ax.set_xlabel('training step')
     ax.set_title('training history')
-    
+
     return fig
 
 
 def main():
-    fig_dir = 'plots_slope3_err1_increaseprior2/'
+    fig_dir = 'plots_tmp/'
 
     # Generate mock data
+    n_stars = 1024 * 128
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
-        60, 4096,
+        60, n_stars,
         sigma_A=1,
         k_slope=3
     )
+    dataset = tf.data.Dataset.from_tensor_slices((A_obs,x_star))
+
+    # For plotting, only keep a subset of stars
+    x_star = x_star[:4096]
+    A_true = A_true[:4096]
+    A_obs = A_obs[:4096]
 
     img_true = calc_image(log_rho_true)
     fig = plot_lnrho_A(img_true, x_star, A_true, title='truth')
@@ -356,8 +381,7 @@ def main():
     #plt.close(fig)
 
     # Optimize model
-    n_steps = 2048
-    plot_every = 2
+    plot_every = 64
 
     def plot_callback(step):
         if (step % plot_every != plot_every-1) and (step != -1):
@@ -387,8 +411,11 @@ def main():
 
     plot_callback(-1)
 
+    batch_size = 512
+    n_epochs = 8
     loss_hist, ln_chi2_hist, prior_hist = train(
-        log_rho_fit, x_star, A_obs, n_steps,
+        log_rho_fit, dataset,
+        n_stars, batch_size, n_epochs,
         callback=plot_callback
     )
 
