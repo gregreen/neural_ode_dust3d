@@ -344,7 +344,7 @@ def main():
     fig_dir = 'plots_tmp/'
 
     # Generate mock data
-    n_stars = 1024 * 128
+    n_stars = 1024 * 32
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
         60, n_stars,
         sigma_A=1,
