@@ -99,7 +99,7 @@ def get_ray_ode(log_rho_fn, dx_dt):
     return ode
 
 
-def plot_lnrho_A(lnrho_img, x_star, A_star, title='', diff=False):
+def plot_lnrho_A(img, x_star, A_star, title='', diff=False, exp=False):
     fig,ax_arr = plt.subplots(
         2,2,
         figsize=(6,6),
@@ -110,21 +110,29 @@ def plot_lnrho_A(lnrho_img, x_star, A_star, title='', diff=False):
     ax,cax_im,cax_sc,ax_empty = ax_arr.flat
     ax_empty.axis('off')
 
-    idx = [slice(int(0.1*s), int(0.9*s)) for s in lnrho_img.shape]
+    # Plot dust density
+    idx = [slice(int(0.1*s), int(0.9*s)) for s in img.shape]
     if diff:
-        vmax = 1.15 * np.percentile(np.abs(lnrho_img[idx[0],idx[1]]), 99)
+        vmax = 1.15 * np.percentile(np.abs(img[idx[0],idx[1]]), 99)
         kw = dict(cmap='coolwarm', vmin=-vmax, vmax=vmax)
-        label = r'$\Delta \ln \rho$'
+        if exp:
+            label = r'$\Delta \rho$'
+        else:
+            label = r'$\Delta \ln \rho$'
     else:
-        vmin,vmax = np.percentile(lnrho_img[idx[0],idx[1]], [2., 98.])
+        vmin,vmax = np.percentile(img[idx[0],idx[1]], [2., 98.])
         w = vmax - vmin
         vmin -= 0.15 * w
         vmax += 0.15 * w
+        if exp:
+            vmin = max(vmin, 0.)
+            label = r'$\rho$'
+        else:
+            label = r'$\ln \rho$'
         kw = dict(vmin=vmin, vmax=vmax)
-        label = r'$\ln \rho$'
-    
+
     im = ax.imshow(
-        lnrho_img,
+        img,
         origin='lower',
         interpolation='nearest',
         extent=[-10,10,-10,10],
@@ -132,6 +140,7 @@ def plot_lnrho_A(lnrho_img, x_star, A_star, title='', diff=False):
     )
     cb_im = fig.colorbar(im, cax=cax_im, orientation='vertical', label=label)
 
+    # Plot stars
     n_stars = len(A_star)
 
     if n_stars:
@@ -154,6 +163,15 @@ def plot_lnrho_A(lnrho_img, x_star, A_star, title='', diff=False):
         cb_sc = fig.colorbar(sc, cax=cax_sc, orientation='horizontal', label=label)
     else:
         cax_sc.axis('off')
+
+    # Plot box in which stars reside
+    ax.plot(
+        [8, 8, -8, -8, 8],
+        [8, -8, -8, 8, 8],
+        ls=':',
+        c='k',
+        alpha=0.5
+    )
 
     ax.xaxis.set_major_locator(ticker.MultipleLocator(5))
     ax.yaxis.set_major_locator(ticker.MultipleLocator(5))
@@ -276,14 +294,18 @@ def train(log_rho_fit, dataset,
     return loss_hist, ln_chi2_hist, prior_hist
 
 
-def gen_mock_data(max_order, n_stars, sigma_A=0, k_slope=4):
+def gen_mock_data(max_order, n_stars, sigma_A=0, k_slope=4, batch_size=1024):
     log_rho = HarmonicExpansion2D(max_order, extent=[10,10], k_slope=k_slope)
 
     rng = np.random.default_rng()
     x_star = rng.uniform(-8, 8, size=(n_stars,2)).astype('f4')
 
-    A = calc_A(log_rho, x_star)
-    A_obs = A + sigma_A * rng.normal(size=A.shape)
+    A = np.empty(n_stars, dtype='f4')
+
+    for i in tqdm(range(0,n_stars,batch_size)):
+        A[i:i+batch_size] = calc_A(log_rho, x_star[i:i+batch_size]).numpy()
+
+    A_obs = A + sigma_A * rng.normal(size=A.shape).astype('f4')
 
     return log_rho, x_star, A, A_obs
 
@@ -341,10 +363,11 @@ def plot_loss(loss_hist, ln_chi2_hist, prior_hist):
 
 
 def main():
-    fig_dir = 'plots_tmp/'
+    fig_dir = 'plots_batch16k/'
 
     # Generate mock data
-    n_stars = 1024 * 32
+    print('Generating mock data ...')
+    n_stars = 1024 * 128
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
         60, n_stars,
         sigma_A=1,
@@ -363,6 +386,9 @@ def main():
     plt.close(fig)
     fig = plot_lnrho_A(img_true, x_star, [], title='truth')
     fig.savefig(os.path.join(fig_dir, 'ln_rho_true_nostars'))
+    plt.close(fig)
+    fig = plot_lnrho_A(img_true, x_star, [], title='truth', exp=True)
+    fig.savefig(os.path.join(fig_dir, 'rho_true_nostars'))
     plt.close(fig)
 
     # Initialize model
@@ -394,6 +420,9 @@ def main():
         fig = plot_lnrho_A(img, x_star, [], title=f'fit (step {step+1})')
         fig.savefig(os.path.join(fig_dir, f'ln_rho_fit_nostars_step{step+1:05d}'))
         plt.close(fig)
+        fig = plot_lnrho_A(np.exp(img), x_star, [], title=f'fit (step {step+1})', exp=True)
+        fig.savefig(os.path.join(fig_dir, f'rho_fit_nostars_step{step+1:05d}'))
+        plt.close(fig)
         fig = plot_lnrho_A(
             img-img_true, x_star, A-A_true,
             title=f'fit - truth (step {step+1})',
@@ -408,11 +437,19 @@ def main():
         )
         fig.savefig(os.path.join(fig_dir, f'ln_rho_diff_nostars_step{step+1:05d}'))
         plt.close(fig)
+        fig = plot_lnrho_A(
+            np.exp(img)-np.exp(img_true), x_star, [],
+            title=f'fit - truth (step {step+1})',
+            diff=True,
+            exp=True
+        )
+        fig.savefig(os.path.join(fig_dir, f'rho_diff_nostars_step{step+1:05d}'))
+        plt.close(fig)
 
     plot_callback(-1)
 
-    batch_size = 512
-    n_epochs = 8
+    batch_size = 1024 * 16
+    n_epochs = 128
     loss_hist, ln_chi2_hist, prior_hist = train(
         log_rho_fit, dataset,
         n_stars, batch_size, n_epochs,
@@ -426,6 +463,9 @@ def main():
     plt.close(fig)
     fig = plot_lnrho_A(img_fit, x_star, [], title='truth')
     fig.savefig(os.path.join(fig_dir, 'ln_rho_fit_nostars'))
+    plt.close(fig)
+    fig = plot_lnrho_A(np.exp(img_fit), x_star, [], title='truth', exp=True)
+    fig.savefig(os.path.join(fig_dir, 'rho_fit_nostars'))
     plt.close(fig)
     fig = plot_lnrho_A(
         img_fit-img_true, x_star, A_fit-A_true,
