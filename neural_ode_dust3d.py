@@ -81,21 +81,17 @@ class HarmonicExpansion2D(snt.Module):
         return tf.reduce_sum(tf.math.pow(self.k2,0.5*slope) * self.ab**2)
 
 
-def get_ray_ode(log_rho_fn, dx_dt):
-    ds_dt = tf.expand_dims(
-        tf.norm(dx_dt, axis=1),
-        1,
-        name='ds_dt'
-    )
-    #tf.print(ds_dt)
-    def ode(t, y):
-        """
+def get_ray_ode(log_rho_fn, x_star):
+    ds_dt = tf.norm(x_star, axis=1, keepdims=True, name='ds_dt')
+    def ode(t, A):
+        r"""
         t = fractional distance along ray
-        y = (\int \exp(\rho) ds, *x)
+        A = \int \exp(\ln \rho) ds
         """
-        A,x = tf.split(y, [1,2], axis=1)
-        dy_dt = tf.concat([ds_dt*tf.math.exp(log_rho_fn(x)), dx_dt], 1)
-        return dy_dt
+        #A,x = tf.split(y, [1,2], axis=1)
+        #dy_dt = tf.concat([ds_dt*tf.math.exp(log_rho_fn(x)), dx_dt], 1)
+        dA_dt = ds_dt * tf.math.exp(log_rho_fn(t*x_star))
+        return dA_dt
     return ode
 
 
@@ -120,14 +116,15 @@ def plot_lnrho_A(img, x_star, A_star, title='', diff=False, exp=False):
         else:
             label = r'$\Delta \ln \rho$'
     else:
-        vmin,vmax = np.percentile(img[idx[0],idx[1]], [2., 98.])
-        w = vmax - vmin
-        vmin -= 0.15 * w
-        vmax += 0.15 * w
         if exp:
-            vmin = max(vmin, 0.)
+            vmin = 0.
+            vmax = np.max(img[idx[0],idx[1]])
             label = r'$\rho$'
         else:
+            vmin,vmax = np.percentile(img[idx[0],idx[1]], [1., 99.])
+            w = vmax - vmin
+            vmin -= 0.15 * w
+            vmax += 0.15 * w
             label = r'$\ln \rho$'
         kw = dict(vmin=vmin, vmax=vmax)
 
@@ -197,41 +194,50 @@ def train(log_rho_fit, dataset,
           callback=None):
     # Break the dataset up into batches
     dataset_batches = dataset.shuffle(
-                          buffer_size=16*batch_size
+                          buffer_size=64*batch_size
                       ).batch(batch_size).repeat(n_epochs)
 
     # Calculate the number of steps from the given
     # dataset size and requested # of epochs
-    n_steps = n_stars * n_epochs
+    n_steps = (n_stars // batch_size) * n_epochs
 
     # Smoothly increase the weight given to the prior during training
     def get_prior_weight(step):
-        log_w0, log_w1 = -2, -1 # base 10
+        log_w0, log_w1 = -3, -3 # base 10
         log_w = log_w0 + step/n_steps * (log_w1-log_w0)
         return tf.constant(10**log_w)
 
     # ODE solver
     solver = tfp.math.ode.DormandPrince(
-        rtol=1e-3, atol=1e-3, name='ray_integrator'
+        rtol=1e-5, atol=1e-6, name='ray_integrator'
     )
 
     # Optimizer, with step-function learning rate
-    lr_values = [1e-3, 1e-4, 1e-5]
+    lr_values = [1e-3, 1e-4, 1e-5, 1e-6]
     n = len(lr_values)
     lr_boundaries = [int((k+1)*n_steps/n) for k in range(n-1)]
+    print(f'n_steps = {n_steps}')
+    print(f'lr_boundaries = {lr_boundaries}')
     lr_schedule = keras.optimizers.schedules.PiecewiseConstantDecay(
         lr_boundaries, lr_values
     )
-    opt = keras.optimizers.SGD(learning_rate=lr_schedule, momentum=0.5)
+    opt = keras.optimizers.SGD(
+        learning_rate=lr_schedule,
+        momentum=0.5,
+        global_clipnorm=100. # Guard-rails to prevent fitter from going haywire
+    )
 
-    def ode(t, y, dx_dt, ds_dt):
-        """
+    def ode(t, A, dx_dt, ds_dt):
+        r"""
         t = fractional distance along ray
-        y = (\int \exp(\rho) ds, *x)
+        A = \int \exp(\ln \rho) ds = extinction
+        dx_dt = change in position per unit time (t) = position of star
+        ds_dt = path length per unit time (t) = distance to star
         """
-        A,x = tf.split(y, [1,2], axis=1)
-        dy_dt = tf.concat([ds_dt*tf.math.exp(log_rho_fit(x)), dx_dt], 1)
-        return dy_dt
+        #A,x = tf.split(y, [1,2], axis=1)
+        #dy_dt = tf.concat([ds_dt*tf.math.exp(log_rho_fit(x)), dx_dt], 1)
+        dA_dt = ds_dt * tf.math.exp(log_rho_fit(t*dx_dt))
+        return dA_dt
 
     # Function that takes one gradient step
     @tf.function
@@ -239,23 +245,18 @@ def train(log_rho_fit, dataset,
         print('Tracing <grad_step()> ...')
 
         #ode_fn = get_ray_ode(log_rho_fit, x_star)
-        ds_dt = tf.expand_dims(
-            tf.norm(x_star, axis=1),
-            1,
-            name='ds_dt'
-        )
+        ds_dt = tf.norm(x_star, axis=1, keepdims=True, name='ds_dt')
 
         with tf.GradientTape() as g:
             print('Solving ODE ...')
             res = solver.solve(
                 ode,
-                0, tf.zeros([batch_size,3]),
+                0, tf.zeros([batch_size,1]),
                 tf.constant([1]),
-                constants={'dx_dt':x_star,'ds_dt':ds_dt}
+                constants={'dx_dt':x_star, 'ds_dt':ds_dt}
             )
             print('Calculating chi^2 ...')
-            A_fit,_ = tf.split(res.states, [1,2], axis=2)
-            A_fit = tf.squeeze(A_fit)
+            A_fit = tf.squeeze(res.states)
             log_chi2 = tf.math.log(tf.reduce_mean((A_obs - A_fit)**2))
             prior = log_rho_fit.prior(3.0)
             loss = log_chi2 + prior_weight * prior
@@ -263,6 +264,8 @@ def train(log_rho_fit, dataset,
         variables = log_rho_fit.trainable_variables
         print('Calculating gradients ...')
         grads = g.gradient(loss, variables)
+        print('Global norm:')
+        tf.print(tf.linalg.global_norm(grads))
         print('Applying gradients ...')
         opt.apply_gradients(zip(grads, variables))
 
@@ -285,7 +288,8 @@ def train(log_rho_fit, dataset,
         step_iter.set_postfix({
             'ln(chi2)': float(ln_chi2),
             'prior': float(prior),
-            'loss': float(loss)
+            'loss': float(loss),
+            'lr': float(opt._decayed_lr(tf.float32))
         })
 
         if callback is not None:
@@ -331,11 +335,11 @@ def calc_A(log_rho, x_star):
     )
     res = solver.solve(
         ode_fn,
-        0, tf.zeros([n_stars,3]),
+        0, tf.zeros([n_stars,1]),
         tf.constant([1])
     )
-    A,_ = tf.split(res.states, [1,2], axis=2)
-    A = tf.squeeze(A)
+    #A,_ = tf.split(res.states, [1,2], axis=2)
+    A = tf.squeeze(res.states)
 
     return A
 
@@ -363,14 +367,14 @@ def plot_loss(loss_hist, ln_chi2_hist, prior_hist):
 
 
 def main():
-    fig_dir = 'plots_batch16k/'
+    fig_dir = 'plots_o40_w30_b8k_sig01/'
 
     # Generate mock data
     print('Generating mock data ...')
     n_stars = 1024 * 128
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
-        60, n_stars,
-        sigma_A=1,
+        40, n_stars,
+        sigma_A=0.1,
         k_slope=3
     )
     dataset = tf.data.Dataset.from_tensor_slices((A_obs,x_star))
@@ -387,7 +391,7 @@ def main():
     fig = plot_lnrho_A(img_true, x_star, [], title='truth')
     fig.savefig(os.path.join(fig_dir, 'ln_rho_true_nostars'))
     plt.close(fig)
-    fig = plot_lnrho_A(img_true, x_star, [], title='truth', exp=True)
+    fig = plot_lnrho_A(np.exp(img_true), x_star, [], title='truth', exp=True)
     fig.savefig(os.path.join(fig_dir, 'rho_true_nostars'))
     plt.close(fig)
 
@@ -448,7 +452,7 @@ def main():
 
     plot_callback(-1)
 
-    batch_size = 1024 * 16
+    batch_size = 1024 * 8
     n_epochs = 128
     loss_hist, ln_chi2_hist, prior_hist = train(
         log_rho_fit, dataset,
@@ -461,10 +465,10 @@ def main():
     fig = plot_lnrho_A(img_fit, x_star, A_fit, title='fit')
     fig.savefig(os.path.join(fig_dir, 'ln_rho_fit'))
     plt.close(fig)
-    fig = plot_lnrho_A(img_fit, x_star, [], title='truth')
+    fig = plot_lnrho_A(img_fit, x_star, [], title='fit')
     fig.savefig(os.path.join(fig_dir, 'ln_rho_fit_nostars'))
     plt.close(fig)
-    fig = plot_lnrho_A(np.exp(img_fit), x_star, [], title='truth', exp=True)
+    fig = plot_lnrho_A(np.exp(img_fit), x_star, [], title='fit', exp=True)
     fig.savefig(os.path.join(fig_dir, 'rho_fit_nostars'))
     plt.close(fig)
     fig = plot_lnrho_A(
