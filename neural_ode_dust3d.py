@@ -18,14 +18,14 @@ import os
 
 
 class HarmonicExpansion2D(snt.Module):
-    def __init__(self, max_order, extent=[1,1], k_slope=0):
+    def __init__(self, max_order, extent=[1,1], k_slope=0, seed=None):
         super(HarmonicExpansion2D, self).__init__()
         self.max_order = max_order
         self.extent = extent
-        self._initialize(k_slope)
+        self._initialize(k_slope, seed=seed)
 
     @snt.once
-    def _initialize(self, k_slope):
+    def _initialize(self, k_slope, seed=None):
         # k-vector
         N = 2 * self.max_order + 1
         shape = [N,N]
@@ -50,7 +50,8 @@ class HarmonicExpansion2D(snt.Module):
         # Initialize coefficients
         sigma = (k2+1)**(-0.5*(k_slope-1))
         sigma /= np.sqrt(np.sum(sigma**2))
-        ab = sigma * np.random.normal(size=shape)
+        rng = np.random.default_rng(seed)
+        ab = sigma * rng.normal(size=shape)
         # sigma = 1 / self.max_order
         self.ab = tf.Variable(ab.astype('f4'), name='ab')
 
@@ -209,17 +210,26 @@ def train(log_rho_fit, dataset,
 
     # ODE solver
     solver = tfp.math.ode.DormandPrince(
-        rtol=1e-5, atol=1e-6, name='ray_integrator'
+        rtol=1e-7, atol=1e-5, name='ray_integrator'
     )
 
     # Optimizer, with step-function learning rate
-    lr_values = [1e-3, 1e-4, 1e-5, 1e-6]
-    n = len(lr_values)
-    lr_boundaries = [int((k+1)*n_steps/n) for k in range(n-1)]
-    print(f'n_steps = {n_steps}')
-    print(f'lr_boundaries = {lr_boundaries}')
-    lr_schedule = keras.optimizers.schedules.PiecewiseConstantDecay(
-        lr_boundaries, lr_values
+    #lr_values = [1e-3, 3e-4, 1e-4, 3e-5, 1e-5, 3e-6, 1e-6]
+    #lr_values = [1e-3, 4.6e-4, 2.2e-4, 1e-4, 4.6e-5, 2.2e-5, 1e-5, 4.6e-6, 2.2e-6, 1e-6]
+    #n = len(lr_values)
+    #lr_boundaries = [int((k+1)*n_steps/n) for k in range(n-1)]
+    #print(f'n_steps = {n_steps}')
+    #print(f'lr_boundaries = {lr_boundaries}')
+    #lr_schedule = keras.optimizers.schedules.PiecewiseConstantDecay(
+    #    lr_boundaries, lr_values
+    #)
+    lr_init, lr_final = 1e-3, 1e-6
+    n_lr_drops = 9
+    lr_schedule = keras.optimizers.schedules.ExponentialDecay(
+        lr_init,
+        decay_steps=int(n_steps/n_lr_drops),
+        decay_rate=(lr_final/lr_init)**(1/n_lr_drops),
+        staircase=True
     )
     opt = keras.optimizers.SGD(
         learning_rate=lr_schedule,
@@ -264,8 +274,8 @@ def train(log_rho_fit, dataset,
         variables = log_rho_fit.trainable_variables
         print('Calculating gradients ...')
         grads = g.gradient(loss, variables)
-        print('Global norm:')
-        tf.print(tf.linalg.global_norm(grads))
+        tf.print('global norm:', tf.linalg.global_norm(grads))
+        tf.print('# of evaluations:', res.diagnostics.num_ode_fn_evaluations)
         print('Applying gradients ...')
         opt.apply_gradients(zip(grads, variables))
 
@@ -298,10 +308,19 @@ def train(log_rho_fit, dataset,
     return loss_hist, ln_chi2_hist, prior_hist
 
 
-def gen_mock_data(max_order, n_stars, sigma_A=0, k_slope=4, batch_size=1024):
-    log_rho = HarmonicExpansion2D(max_order, extent=[10,10], k_slope=k_slope)
+def gen_mock_data(max_order, n_stars,
+                  sigma_A=0, k_slope=4,
+                  batch_size=1024, seed=None):
+    log_rho = HarmonicExpansion2D(
+        max_order,
+        extent=[10,10],
+        k_slope=k_slope,
+        seed=seed
+    )
 
-    rng = np.random.default_rng()
+    if seed is not None:
+        seed = 2 * seed + 1 # Use different seed for locations of stars
+    rng = np.random.default_rng(seed)
     x_star = rng.uniform(-8, 8, size=(n_stars,2)).astype('f4')
 
     A = np.empty(n_stars, dtype='f4')
@@ -331,7 +350,7 @@ def calc_A(log_rho, x_star):
     n_stars = x_star.shape[0]
     ode_fn = get_ray_ode(log_rho, x_star)
     solver = tfp.math.ode.DormandPrince(
-        rtol=1e-4, atol=1e-4, name='ray_integrator'
+        rtol=1e-8, atol=1e-7, name='ray_integrator'
     )
     res = solver.solve(
         ode_fn,
@@ -367,7 +386,10 @@ def plot_loss(loss_hist, ln_chi2_hist, prior_hist):
 
 
 def main():
-    fig_dir = 'plots_o40_w30_b8k_sig01/'
+    fig_dir = 'plots_o80_w30_b8k_sig01_tol75_ep64_randfixed/'
+    seed_mock, seed_fit, seed_tf = 17, 31, 101 # Fix psuedorandom seeds
+
+    tf.random.set_seed(seed_tf)
 
     # Generate mock data
     print('Generating mock data ...')
@@ -375,7 +397,9 @@ def main():
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
         40, n_stars,
         sigma_A=0.1,
-        k_slope=3
+        k_slope=3,
+        batch_size=8*1024,
+        seed=seed_mock
     )
     dataset = tf.data.Dataset.from_tensor_slices((A_obs,x_star))
 
@@ -396,22 +420,18 @@ def main():
     plt.close(fig)
 
     # Initialize model
-    log_rho_fit = HarmonicExpansion2D(40, extent=[10,10], k_slope=6)
+    log_rho_fit = HarmonicExpansion2D(
+        40,
+        extent=[10,10],
+        k_slope=6,
+        seed=seed_fit
+    )
 
     n_trainable = sum([tf.size(v) for v in log_rho_fit.trainable_variables])
     print(f'{n_trainable} trainable variables.')
 
-    #A_init = calc_A(log_rho_fit, x_star)
-    #img_init = calc_image(log_rho_fit)
-    #fig = plot_lnrho_A(img_init, x_star, A_init, title='fit (step 0)')
-    #fig.savefig(os.path.join(fig_dir, 'ln_rho_stars_step00000'))
-    #plt.close(fig)
-    #fig = plot_lnrho_A(img_init, x_star, [], title='fit (step 0)')
-    #fig.savefig(os.path.join(fig_dir, 'ln_rho_nostars_step00000'))
-    #plt.close(fig)
-
     # Optimize model
-    plot_every = 64
+    plot_every = 16
 
     def plot_callback(step):
         if (step % plot_every != plot_every-1) and (step != -1):
@@ -453,7 +473,7 @@ def main():
     plot_callback(-1)
 
     batch_size = 1024 * 8
-    n_epochs = 128
+    n_epochs = 64
     loss_hist, ln_chi2_hist, prior_hist = train(
         log_rho_fit, dataset,
         n_stars, batch_size, n_epochs,
