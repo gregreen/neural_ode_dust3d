@@ -62,7 +62,7 @@ class HarmonicExpansion2D(snt.Module):
         Inputs:
           x (tf.Tensor): Input coordinates. Has
             shape (# of points, # of dimensions).
-        
+
         Outputs:
           f(x), the value of the harmonic expansion at the points x.
           Has shape (# of points, 1).
@@ -77,7 +77,7 @@ class HarmonicExpansion2D(snt.Module):
         )
         res = tf.expand_dims(res, 1)
         return res
-    
+
     def prior(self, slope):
         return tf.reduce_sum(tf.math.pow(self.k2,0.5*slope) * self.ab**2)
 
@@ -208,26 +208,14 @@ def train(log_rho_fit, dataset,
         log_w = log_w0 + step/n_steps * (log_w1-log_w0)
         return tf.constant(10**log_w)
 
-    # ODE solver
-    solver = tfp.math.ode.DormandPrince(
-        rtol=1e-7, atol=1e-5, name='ray_integrator'
-    )
+    gamma = tf.constant(3.0) # Slope of penalty on high-k modes
 
-    # Optimizer, with step-function learning rate
-    #lr_values = [1e-3, 3e-4, 1e-4, 3e-5, 1e-5, 3e-6, 1e-6]
-    #lr_values = [1e-3, 4.6e-4, 2.2e-4, 1e-4, 4.6e-5, 2.2e-5, 1e-5, 4.6e-6, 2.2e-6, 1e-6]
-    #n = len(lr_values)
-    #lr_boundaries = [int((k+1)*n_steps/n) for k in range(n-1)]
-    #print(f'n_steps = {n_steps}')
-    #print(f'lr_boundaries = {lr_boundaries}')
-    #lr_schedule = keras.optimizers.schedules.PiecewiseConstantDecay(
-    #    lr_boundaries, lr_values
-    #)
+    # Optimizer, with staircase-exponential learning rate
     lr_init, lr_final = 1e-3, 1e-6
     n_lr_drops = 9
     lr_schedule = keras.optimizers.schedules.ExponentialDecay(
         lr_init,
-        decay_steps=int(n_steps/n_lr_drops),
+        decay_steps=int(n_steps/(n_lr_drops+1)),
         decay_rate=(lr_final/lr_init)**(1/n_lr_drops),
         staircase=True
     )
@@ -237,75 +225,84 @@ def train(log_rho_fit, dataset,
         global_clipnorm=100. # Guard-rails to prevent fitter from going haywire
     )
 
-    def ode(t, A, dx_dt, ds_dt):
-        r"""
-        t = fractional distance along ray
-        A = \int \exp(\ln \rho) ds = extinction
-        dx_dt = change in position per unit time (t) = position of star
-        ds_dt = path length per unit time (t) = distance to star
-        """
-        #A,x = tf.split(y, [1,2], axis=1)
-        #dy_dt = tf.concat([ds_dt*tf.math.exp(log_rho_fit(x)), dx_dt], 1)
-        dA_dt = ds_dt * tf.math.exp(log_rho_fit(t*dx_dt))
-        return dA_dt
+    # Get the loss function, with a given integrator tolerance
+    loss_fn = get_loss_function(rtol=1e-7, atol=1e-5)
 
-    # Function that takes one gradient step
+    # Function that takes one gradient-descent step
     @tf.function
     def grad_step(A_obs, x_star, prior_weight):
         print('Tracing <grad_step()> ...')
 
-        #ode_fn = get_ray_ode(log_rho_fit, x_star)
+        # Calculate distance to each star
+        #tf.print('Calculating ds_dt')
         ds_dt = tf.norm(x_star, axis=1, keepdims=True, name='ds_dt')
 
+        # Calculate loss
+        #tf.print('loss_fn')
         with tf.GradientTape() as g:
-            print('Solving ODE ...')
-            res = solver.solve(
-                ode,
-                0, tf.zeros([batch_size,1]),
-                tf.constant([1]),
-                constants={'dx_dt':x_star, 'ds_dt':ds_dt}
+            loss, log_chi2, prior, A_fit, diagnostics = loss_fn(
+                A_obs, x_star, ds_dt, log_rho_fit,
+                batch_size=batch_size,
+                prior_weight=prior_weight,
+                gamma=gamma
             )
-            print('Calculating chi^2 ...')
-            A_fit = tf.squeeze(res.states)
-            log_chi2 = tf.math.log(tf.reduce_mean((A_obs - A_fit)**2))
-            prior = log_rho_fit.prior(3.0)
-            loss = log_chi2 + prior_weight * prior
 
+        # Calculate and apply gradients of loss w.r.t. training variables
         variables = log_rho_fit.trainable_variables
-        print('Calculating gradients ...')
+        #tf.print('Calculating gradients')
         grads = g.gradient(loss, variables)
-        tf.print('global norm:', tf.linalg.global_norm(grads))
-        tf.print('# of evaluations:', res.diagnostics.num_ode_fn_evaluations)
-        print('Applying gradients ...')
+        #tf.print('Applying gradients')
         opt.apply_gradients(zip(grads, variables))
 
-        print('Returning ...')
-        return loss, A_fit, log_chi2, prior
+        # Return some useful diagnostics
+        #tf.print('Calculating norm')
+        norm = tf.linalg.global_norm(grads)
+        #tf.print('Calculating n_eval')
+        n_eval = diagnostics.num_ode_fn_evaluations
+        #tf.print('global norm:', norm)
+        #tf.print('# of evaluations:', n_eval)
 
-    loss_hist = []
-    ln_chi2_hist = []
-    prior_hist = []
+        return loss, A_fit, log_chi2, prior, norm, n_eval
 
-    n_steps = (n_stars // batch_size) * n_epochs
+    # Keep track of history of loss, chi^2 and prior during training
+    history = {
+        'loss': [],
+        'ln_chi2': [],
+        'prior': [],
+        'norm': [],
+        'n_eval': []
+    }
+
+    # Take gradient-descent steps on training batches
     step_iter = tqdm(enumerate(dataset_batches), total=n_steps)
     for i,(A_obs,x_star) in step_iter:
         prior_weight = get_prior_weight(i)
-        loss, A_fit, ln_chi2, prior = grad_step(A_obs, x_star, prior_weight)
+        loss, A_fit, ln_chi2, prior, norm, n_eval = grad_step(
+            A_obs, x_star, prior_weight
+        )
 
-        loss_hist.append(loss)
-        ln_chi2_hist.append(ln_chi2)
-        prior_hist.append(prior)
+        history['loss'].append(float(loss))
+        history['ln_chi2'].append(float(ln_chi2))
+        history['prior'].append(float(prior))
+        history['norm'].append(float(norm))
+        history['n_eval'].append(int(n_eval))
+
+        # Display diagnostics on progress bar
         step_iter.set_postfix({
             'ln(chi2)': float(ln_chi2),
             'prior': float(prior),
             'loss': float(loss),
-            'lr': float(opt._decayed_lr(tf.float32))
+            'lr': float(opt._decayed_lr(tf.float32)),
+            'norm': float(norm),
+            'n_eval': int(n_eval)
         })
 
+        # Call the given callback function, which may, for example, plot
+        # the current ln(rho) field
         if callback is not None:
             callback(i)
 
-    return loss_hist, ln_chi2_hist, prior_hist
+    return history
 
 
 def gen_mock_data(max_order, n_stars,
@@ -363,37 +360,111 @@ def calc_A(log_rho, x_star):
     return A
 
 
-def plot_loss(loss_hist, ln_chi2_hist, prior_hist):
-    fig,ax = plt.subplots(1,1, figsize=(6,4))
+def plot_loss(history):
+    fig,(ax_u,ax_l) = plt.subplots(2,1, figsize=(6,6))
 
-    ax.plot(loss_hist, label='loss')
-    ax.plot(ln_chi2_hist, alpha=0.5, label=r'$\ln \chi^2$')
-    ax.plot([], [], alpha=0.5, label='prior') # dummy plot, for legend
-    ax.set_ylabel(r'loss, $\ln \chi^2$')
+    ax_u.plot(history['loss'], label='loss')
+    ax_u.plot(history['ln_chi2'], alpha=0.5, label=r'$\ln \chi^2$')
 
-    ax2 = ax.twinx()
+    ax_u.plot([], [], alpha=0.5, label='prior') # dummy plot, for legend
+    ax_u.set_ylabel(r'loss, $\ln \chi^2$')
+
+    ax2 = ax_u.twinx()
     for i in range(2):
         ax2.plot([],[]) # dummy plots, to cycle colors on ax2
-    ax2.plot(prior_hist, alpha=0.5)
+    ax2.plot(history['prior'], alpha=0.5)
     ax2.set_ylabel(r'prior')
 
-    ax.legend(loc='upper right')
+    ax_l.plot(
+        history['norm'],
+        label=r'$\left|\nabla\left(\mathrm{loss}\right)\right|$'
+    )
+    ax_l.set_ylabel(r'$\left|\nabla\left(\mathrm{loss}\right)\right|$')
 
-    ax.set_xlabel('training step')
-    ax.set_title('training history')
+    if 'n_eval' in history:
+        ax_l.plot([], [], label='# evaluations') # dummy
+        ax2 = ax_l.twinx()
+        ax2.plot([], []) # dummy
+        ax2.plot(history['n_eval'])
+        ax2.set_ylabel(r'# evaluations')
+
+    ax_u.legend(loc='upper right')
+    ax_l.legend(loc='center right')
+
+    ax_l.set_xlabel('training step')
+    ax_u.set_title('training history')
+
+    ax_u.set_xticklabels([])
+
+    ax_u.grid('on', axis='x', alpha=0.1)
+    ax_l.grid('on', axis='x', alpha=0.1)
+
+    fig.subplots_adjust(
+        top=0.94,
+        bottom=0.10,
+        left=0.14,
+        right=0.86,
+        hspace=0.05
+    )
 
     return fig
 
 
+def get_loss_function(rtol=1e-7, atol=1e-5):
+    """
+    Returns a function that calculates the loss of
+    a model of ln(rho), given a set of stellar observations.
+
+    Inputs:
+      rtol (float): Relative tolerance of the integrator (default: 1e-7).
+      atol (float): Absolute tolerance of the integrator (default: 1e-5).
+
+    Returns:
+      `calc_loss`, the loss function.
+    """
+    # ODE solver
+    solver = tfp.math.ode.DormandPrince(
+        rtol=rtol, atol=atol, name='ray_integrator'
+    )
+
+    def calc_loss(A_obs, x_star, ds_dt, log_rho_model,
+                  batch_size=1024,
+                  prior_weight=tf.constant(1e-3),
+                  gamma=tf.constant(3.0)):
+        def ode(t, A, dx_dt, ds_dt):
+            r"""
+            t = fractional distance along ray
+            A = \int \exp(\ln \rho) ds = extinction
+            dx_dt = change in position per unit time (t) = position of star
+            ds_dt = path length per unit time (t) = distance to star
+            """
+            dA_dt = ds_dt * tf.math.exp(log_rho_model(t*dx_dt))
+            return dA_dt
+
+        res = solver.solve(
+            ode,
+            0, tf.zeros([batch_size,1]),
+            tf.constant([1]),
+            constants={'dx_dt':x_star, 'ds_dt':ds_dt}
+        )
+        A_model = tf.squeeze(res.states)
+        log_chi2 = tf.math.log(tf.reduce_mean((A_obs - A_model)**2))
+        prior = log_rho_model.prior(gamma)
+        loss = log_chi2 + prior_weight * prior
+        return loss, log_chi2, prior, A_model, res.diagnostics
+
+    return calc_loss
+
+
 def main():
-    fig_dir = 'plots_o80_w30_b8k_sig01_tol75_ep64_randfixed/'
+    fig_dir = 'plots_test/'
     seed_mock, seed_fit, seed_tf = 17, 31, 101 # Fix psuedorandom seeds
 
     tf.random.set_seed(seed_tf)
 
     # Generate mock data
     print('Generating mock data ...')
-    n_stars = 1024 * 128
+    n_stars = 1024 * 512
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
         40, n_stars,
         sigma_A=0.1,
@@ -402,6 +473,13 @@ def main():
         seed=seed_mock
     )
     dataset = tf.data.Dataset.from_tensor_slices((A_obs,x_star))
+
+    # Calculate chi^2 and prior of truth
+    ln_chi2_true = np.log(np.mean((A_obs-A_true)**2))
+    prior_true = log_rho_true.prior(3.0)
+    print('Using true model:')
+    print(f'  ln(chi^2) = {ln_chi2_true:.5f}')
+    print(f'      prior = {prior_true:.5f}')
 
     # For plotting, only keep a subset of stars
     x_star = x_star[:4096]
@@ -431,7 +509,7 @@ def main():
     print(f'{n_trainable} trainable variables.')
 
     # Optimize model
-    plot_every = 16
+    plot_every = 32
 
     def plot_callback(step):
         if (step % plot_every != plot_every-1) and (step != -1):
@@ -473,8 +551,8 @@ def main():
     plot_callback(-1)
 
     batch_size = 1024 * 8
-    n_epochs = 64
-    loss_hist, ln_chi2_hist, prior_hist = train(
+    n_epochs = 16
+    history = train(
         log_rho_fit, dataset,
         n_stars, batch_size, n_epochs,
         callback=plot_callback
@@ -509,7 +587,7 @@ def main():
     )
     fig.savefig(os.path.join(fig_dir, 'ln_rho_diff_nostars'))
     plt.close(fig)
-    fig = plot_loss(loss_hist, ln_chi2_hist, prior_hist)
+    fig = plot_loss(history)
     fig.savefig(os.path.join(fig_dir, 'loss_history'))
     plt.close(fig)
 
