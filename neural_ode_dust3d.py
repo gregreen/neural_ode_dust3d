@@ -48,7 +48,8 @@ class HarmonicExpansion2D(snt.Module):
         self.b_mask = tf.constant(b_mask)
 
         # Initialize coefficients
-        sigma = (k2+1)**(-0.5*(k_slope-1))
+        sigma = k2**(-0.5*k_slope)
+        sigma[self.max_order,self.max_order] = 1.0
         sigma /= np.sqrt(np.sum(sigma**2))
         rng = np.random.default_rng(seed)
         ab = sigma * rng.normal(size=shape)
@@ -208,7 +209,7 @@ def train(log_rho_fit, dataset,
         log_w = log_w0 + step/n_steps * (log_w1-log_w0)
         return tf.constant(10**log_w)
 
-    gamma = tf.constant(3.0) # Slope of penalty on high-k modes
+    gamma = tf.constant(1.8) # Slope of penalty on high-k modes
 
     # Optimizer, with staircase-exponential learning rate
     lr_init, lr_final = 1e-3, 1e-6
@@ -430,7 +431,7 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
     def calc_loss(A_obs, x_star, ds_dt, log_rho_model,
                   batch_size=1024,
                   prior_weight=tf.constant(1e-3),
-                  gamma=tf.constant(3.0)):
+                  gamma=tf.constant(2.0)):
         def ode(t, A, dx_dt, ds_dt):
             r"""
             t = fractional distance along ray
@@ -468,7 +469,7 @@ def main():
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
         40, n_stars,
         sigma_A=0.1,
-        k_slope=3,
+        k_slope=1.8,
         batch_size=8*1024,
         seed=seed_mock
     )
@@ -476,7 +477,7 @@ def main():
 
     # Calculate chi^2 and prior of truth
     ln_chi2_true = np.log(np.mean((A_obs-A_true)**2))
-    prior_true = log_rho_true.prior(3.0)
+    prior_true = log_rho_true.prior(1.8)
     print('Using true model:')
     print(f'  ln(chi^2) = {ln_chi2_true:.5f}')
     print(f'      prior = {prior_true:.5f}')
