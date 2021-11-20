@@ -13,8 +13,200 @@ import tensorflow_probability as tfp
 import tensorflow_addons as tfa
 import sonnet as snt
 
+import itertools
 from tqdm import tqdm
 import os
+
+
+class FourierSeriesND(snt.Module):
+    def __init__(self, n_dim, max_order,
+                 extent=1, k_slope=0,
+                 mean=0, sigma=1,
+                 k_ball=True,
+                 phase_form=False,
+                 seed=None):
+        super(FourierSeriesND, self).__init__()
+        self.n_dim = n_dim
+        if hasattr(max_order, '__len__'):
+            self.max_order = max_order
+        else:
+            self.max_order = [max_order]*n_dim
+        if hasattr(extent, '__len__'):
+            self.extent = extent
+        else:
+            self.extent = [extent]*n_dim
+        self._k_ball = k_ball
+        self._phase_form = phase_form
+        self._initialize(k_slope, mean, sigma, seed=seed)
+
+    def _get_k_matrix(self, region, flatten=False):
+        k_axes = []
+        for i,s in enumerate(region):
+            scale = np.pi / self.extent[i]
+            if s == -1:
+                k_axes.append(-scale*np.arange(1,self.max_order[i]+1))
+            elif s == 0:
+                k_axes.append([0])
+            elif s == 1:
+                k_axes.append(scale*np.arange(1,self.max_order[i]+1))
+            else:
+                raise ValueError(f'Invalid region description: {region}')
+
+        k = np.stack(np.meshgrid(*k_axes), axis=0)
+
+        if flatten:
+            k.shape = (self.n_dim,-1)
+
+        return k
+
+    @snt.once
+    def _initialize(self, k_slope, mean, sigma_tot, seed=None):
+        rng = np.random.default_rng(seed)
+
+        # Enumerate the regions of k-space that, combined with their mirror
+        # (k -> -k), make up all of k-space, except for k = 0.
+        regions = []
+        mirrored = [(0,)*self.n_dim]
+        for key in itertools.product(*([(-1,0,1)]*self.n_dim)):
+            if key not in mirrored:
+                regions.append(key)
+                mirrored.append(tuple([-s for s in key]))
+
+        # Construct k-tensor, containing all the non-degenerate modes
+        k = np.concatenate(
+            [self._get_k_matrix(key, flatten=True) for key in regions],
+            axis=1
+        )
+        k2 = np.sum(k**2, axis=0)
+
+        # Limit modes to spherical region in k-space?
+        if self._k_ball:
+            k_max = np.min(np.pi*np.array(self.max_order)/np.array(self.extent))
+            idx = (k2 <= k_max**2 + 1e-5)
+            k = k[:,idx]
+            k2 = k2[idx]
+
+        # Calculate sigma of each mode (based on power spectrum)
+        sigma = k2**(-0.5*k_slope)
+        norm = sigma_tot / np.sqrt(1+np.sum(sigma**2))
+
+        # Generate coefficients and phases
+        self.zp = tf.Variable(
+            mean + norm*rng.normal(),
+            name='zp',
+            dtype=tf.float32
+        )
+        self.a = tf.Variable(
+            norm*sigma*rng.normal(size=sigma.shape),
+            name='a',
+            dtype=tf.float32
+        )
+        if self._phase_form:
+            self.phi = tf.Variable(
+                rng.uniform(0, 2*np.pi, size=sigma.shape),
+                name='phi',
+                dtype=tf.float32,
+                #constraint=lambda x: tf.math.mod(x, 2*np.pi)
+            )
+        else:
+            self.b = tf.Variable(
+                norm*sigma*rng.normal(size=sigma.shape),
+                name='b',
+                dtype=tf.float32
+            )
+
+        # Save constants
+        self.k = tf.constant(k, name='k', dtype=tf.float32)
+        self.k2 = tf.constant(k2, name='k2', dtype=tf.float32)
+
+    def copy_modes(self, model):
+        assert model._phase_form == self._phase_form
+        assert self._k_ball and model._k_ball
+
+        # Sort modes by k^2 in order to match
+        k_model = model.k.numpy()
+        k2_model = model.k2.numpy()
+        n_model = k2_model.size
+
+        k = self.k.numpy()
+        k2 = self.k2.numpy()
+        n = k2.size
+
+        idx_model = np.argsort(k2_model, kind='stable') # Stability is critical!
+        idx_self = np.argsort(k2, kind='stable')
+
+        # Ensure that k-vectors of k^2-sorted modes match
+        np.testing.assert_allclose(
+            k[:,idx_self[:n_model]],
+            k_model[:,idx_model[:n]],
+            atol=1e-8, rtol=1e-8
+        )
+
+        # Copy over the amplitudes and phases
+        k = k[:,idx_self]
+        self.k = tf.constant(k, dtype=tf.float32, name='k')
+
+        k2 = k2[idx_self]
+        self.k2 = tf.constant(k2, dtype=tf.float32, name='k2')
+
+        self.zp = tf.Variable(model.zp.numpy(), dtype=tf.float32, name='zp')
+
+        a = self.a.numpy()
+        a = a[idx_self]
+        a[:n_model] = model.a.numpy()[idx_model[:n]]
+        self.a = tf.Variable(a, dtype=tf.float32, name='a')
+
+        if self._phase_form:
+            phi = self.phi.numpy()
+            phi = phi[idx_self]
+            phi[:n_model] = model.phi.numpy()[idx_model[:n]]
+            self.phi = tf.Variable(phi, dtype=tf.float32, name='phi')
+        else:
+            b = self.b.numpy()
+            b = b[idx_self]
+            b[:n_model] = model.b.numpy()[idx_model[:n]]
+            self.b = tf.Variable(b, dtype=tf.float32, name='b')
+
+
+    def __call__(self, x):
+        """
+        Evaluates the harmonic expansion at the points x.
+
+        Inputs:
+          x (tf.Tensor): Input coordinates. Has
+            shape (# of points, # of dimensions).
+
+        Outputs:
+          f(x), the value of the harmonic expansion at the points x.
+          Has shape (# of points, 1).
+        """
+        # z_{jk} = x_{ji} k_{ik} ( + phi_{jk} ),
+        # where
+        #   j := point,
+        #   i := dimension,
+        #   k := mode
+        # y_{j} = a_{k} cos(z_{jk}) ( + b_{k} sin(z_{jk}) )
+        z = tf.tensordot(x, self.k, axes=[[1],[0]])
+        if self._phase_form:
+            z = z + self.phi
+
+        res = self.zp + tf.tensordot(self.a, tf.math.cos(z), axes=[[0],[1]])
+        if not self._phase_form:
+            res = res + tf.tensordot(self.b, tf.math.sin(z), axes=[[0],[1]])
+
+        res = tf.expand_dims(res, 1)
+        return res
+
+    def prior(self, k_slope):
+        # Penalties on amplitudes
+        if self._phase_form:
+            p = tf.reduce_sum(tf.math.pow(self.k2,0.5*k_slope) * self.a**2)
+        else:
+            p = tf.reduce_sum(
+                tf.math.pow(self.k2,0.5*k_slope) * (self.a**2 + self.b**2)
+            )
+        # No penalty on (0,0) term (the zero point)
+        return p
 
 
 class HarmonicExpansion2D(snt.Module):
@@ -95,6 +287,101 @@ def get_ray_ode(log_rho_fn, x_star):
         dA_dt = ds_dt * tf.math.exp(log_rho_fn(t*x_star))
         return dA_dt
     return ode
+
+
+def plot_modes(model, gamma=0, title=None):
+    fig,ax = plt.subplots(
+        1,1,
+        subplot_kw=dict(aspect='equal'),
+        figsize=(7.3,6),
+        dpi=100
+    )
+
+    k = model.k.numpy()
+    k2 = model.k2.numpy()
+    a = model.a.numpy()
+
+    n = a.size
+    v = k2**(0.5*gamma) * a
+    vmax = np.max(np.abs(v))
+
+    idx = np.argmin(np.pi*np.array(model.max_order)/np.array(model.extent))
+    max_order = model.max_order[idx]
+    kw = dict(
+        edgecolors='none',
+        s=(320/(2*max_order+1))**2,
+        marker='s',
+        vmin=-vmax,
+        vmax=vmax,
+        cmap='coolwarm'
+    )
+
+    im = ax.scatter(k[0], k[1], c=v, **kw)
+
+    if not model._phase_form:
+        b = model.b.numpy()
+        v = k2**(0.5*gamma) * b
+        ax.scatter(-k[0], -k[1], c=v, **kw)
+
+    #cb = fig.colorbar(im, ax=ax, location='right', label=r'$a_{\vec{k}}$')
+    fig.colorbar(im, label=fr'$k^{{{gamma}}} a_{{\vec{{k}}}}$')
+
+    ax.set_xlabel(r'$k_x$')
+    ax.set_ylabel(r'$k_y$')
+
+    if title is None:
+        ax.set_title(r'Fourier space')
+    else:
+        ax.set_title(title)
+
+    return fig
+
+
+def plot_power(model, gamma=None, title=None):
+    k2 = model.k2.numpy()
+    a2 = model.a.numpy()**2
+    if not model._phase_form:
+        a2 += model.b.numpy()**2
+
+    n_bins = max(10, int(np.sqrt(k2.size)/4))
+    ln_k2_min = np.log(np.min(k2))
+    ln_k2_max = np.log(np.max(k2))
+    k2_bins = np.exp(np.linspace(ln_k2_min, ln_k2_max, n_bins))
+
+    bin_idx = np.digitize(k2, k2_bins)
+    power_bin = np.zeros(k2_bins.size)
+
+    for j,i in enumerate(np.unique(bin_idx)):
+        idx = (bin_idx == i)
+        power_bin[j] = np.mean(a2[idx])
+
+    k_mid = (k2_bins[1:]*k2_bins[:-1])**(1/4)
+
+    fig,ax = plt.subplots(1,1, figsize=(6,6), dpi=100)
+
+    if gamma is not None:
+        c = np.median(power_bin[:-1] * k_mid**(2*gamma))
+        ax.loglog(
+            k_mid, c*k_mid**(-2*gamma),
+            ls=':', alpha=0.5,
+            label=fr'$\propto k^{{-{2*gamma}}}$'
+        )
+
+    ax.loglog(k_mid, power_bin[:-1], label='model')
+
+    ax.set_xlabel(r'$k$')
+    ax.set_ylabel(r'$\left< \left| a \right|^2 \right>$')
+
+    if title is None:
+        ax.set_title('power')
+    else:
+        ax.set_title(title)
+
+    ax.legend()
+
+    fig.subplots_adjust(left=0.16, right=0.94, bottom=0.12, top=0.90)
+
+    return fig
 
 
 def plot_lnrho_A(img, x_star, A_star, title='', diff=False, exp=False):
@@ -193,6 +480,9 @@ def plot_lnrho_A(img, x_star, A_star, title='', diff=False, exp=False):
 
 def train(log_rho_fit, dataset,
           n_stars, batch_size, n_epochs,
+          lr0=1e-3, lr1=1e-6, n_lr_drops=9,
+          log_w0=-2, log_w1=-3,
+          gamma0=1.8, gamma1=1.8,
           callback=None):
     # Break the dataset up into batches
     dataset_batches = dataset.shuffle(
@@ -205,19 +495,21 @@ def train(log_rho_fit, dataset,
 
     # Smoothly increase the weight given to the prior during training
     def get_prior_weight(step):
-        log_w0, log_w1 = -3, -3 # base 10
-        log_w = log_w0 + step/n_steps * (log_w1-log_w0)
+        log_w = log_w0 + step/n_steps * (log_w1-log_w0) # base 10
         return tf.constant(10**log_w)
 
-    gamma = tf.constant(1.8) # Slope of penalty on high-k modes
+    # Get step-dependent penalty on high-k modes
+    def get_gamma(step):
+        g = gamma0 + step/n_steps * (gamma1-gamma0)
+        return tf.constant(g)
+
+    #gamma = tf.constant(1.8) # Slope of penalty on high-k modes
 
     # Optimizer, with staircase-exponential learning rate
-    lr_init, lr_final = 1e-3, 1e-6
-    n_lr_drops = 9
     lr_schedule = keras.optimizers.schedules.ExponentialDecay(
-        lr_init,
+        lr0,
         decay_steps=int(n_steps/(n_lr_drops+1)),
-        decay_rate=(lr_final/lr_init)**(1/n_lr_drops),
+        decay_rate=(lr1/lr0)**(1/n_lr_drops),
         staircase=True
     )
     opt = keras.optimizers.SGD(
@@ -231,7 +523,7 @@ def train(log_rho_fit, dataset,
 
     # Function that takes one gradient-descent step
     @tf.function
-    def grad_step(A_obs, x_star, prior_weight):
+    def grad_step(A_obs, x_star, prior_weight, gamma):
         print('Tracing <grad_step()> ...')
 
         # Calculate distance to each star
@@ -278,8 +570,9 @@ def train(log_rho_fit, dataset,
     step_iter = tqdm(enumerate(dataset_batches), total=n_steps)
     for i,(A_obs,x_star) in step_iter:
         prior_weight = get_prior_weight(i)
+        gamma = get_gamma(i)
         loss, A_fit, ln_chi2, prior, norm, n_eval = grad_step(
-            A_obs, x_star, prior_weight
+            A_obs, x_star, prior_weight, gamma
         )
 
         history['loss'].append(float(loss))
@@ -295,7 +588,9 @@ def train(log_rho_fit, dataset,
             'loss': float(loss),
             'lr': float(opt._decayed_lr(tf.float32)),
             'norm': float(norm),
-            'n_eval': int(n_eval)
+            'n_eval': int(n_eval),
+            'gamma': float(gamma),
+            'weight': float(prior_weight)
         })
 
         # Call the given callback function, which may, for example, plot
@@ -309,9 +604,16 @@ def train(log_rho_fit, dataset,
 def gen_mock_data(max_order, n_stars,
                   sigma_A=0, k_slope=4,
                   batch_size=1024, seed=None):
-    log_rho = HarmonicExpansion2D(
+    #log_rho = HarmonicExpansion2D(
+    #    max_order,
+    #    extent=[10,10],
+    #    k_slope=k_slope,
+    #    seed=seed
+    #)
+    log_rho = FourierSeriesND(
+        2,
         max_order,
-        extent=[10,10],
+        extent=10,
         k_slope=k_slope,
         seed=seed
     )
@@ -323,8 +625,13 @@ def gen_mock_data(max_order, n_stars,
 
     A = np.empty(n_stars, dtype='f4')
 
+    @tf.function
+    def calc_A_batch(x):
+        return calc_A(log_rho, x)
+
     for i in tqdm(range(0,n_stars,batch_size)):
-        A[i:i+batch_size] = calc_A(log_rho, x_star[i:i+batch_size]).numpy()
+        A[i:i+batch_size] = calc_A_batch(x_star[i:i+batch_size]).numpy()
+        #A[i:i+batch_size] = calc_A(log_rho, x_star[i:i+batch_size]).numpy()
 
     A_obs = A + sigma_A * rng.normal(size=A.shape).astype('f4')
 
@@ -457,17 +764,92 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
     return calc_loss
 
 
+def get_training_callback(log_rho_fit, x_star, A_true,
+                          img_true, fig_dir, plot_every=16):
+    def plot_callback(step):
+        if (step % plot_every != plot_every-1) and (step != -1):
+            return
+        fig = plot_modes(
+            log_rho_fit,
+            gamma=1.8,
+            title=f'Fourier space (step {step+1})',
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'fourier_step{step+1:05d}')
+        )
+        plt.close(fig)
+        fig = plot_power(
+            log_rho_fit,
+            gamma=1.8,
+            title=f'power (step {step+1})',
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'power_step{step+1:05d}')
+        )
+        plt.close(fig)
+        img = calc_image(log_rho_fit)
+        A = calc_A(log_rho_fit, x_star)
+        fig = plot_lnrho_A(img, x_star, A, title=f'fit (step {step+1})')
+        fig.savefig(
+            os.path.join(fig_dir, f'ln_rho_fit_stars_step{step+1:05d}')
+        )
+        plt.close(fig)
+        fig = plot_lnrho_A(img, x_star, [], title=f'fit (step {step+1})')
+        fig.savefig(
+            os.path.join(fig_dir, f'ln_rho_fit_nostars_step{step+1:05d}')
+        )
+        plt.close(fig)
+        fig = plot_lnrho_A(
+            np.exp(img),
+            x_star, [],
+            title=f'fit (step {step+1})',
+            exp=True
+        )
+        fig.savefig(os.path.join(fig_dir, f'rho_fit_nostars_step{step+1:05d}'))
+        plt.close(fig)
+        fig = plot_lnrho_A(
+            img-img_true, x_star, A-A_true,
+            title=f'fit - truth (step {step+1})',
+            diff=True
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'ln_rho_diff_stars_step{step+1:05d}')
+        )
+        plt.close(fig)
+        fig = plot_lnrho_A(
+            img-img_true, x_star, [],
+            title=f'fit - truth (step {step+1})',
+            diff=True
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'ln_rho_diff_nostars_step{step+1:05d}')
+        )
+        plt.close(fig)
+        fig = plot_lnrho_A(
+            np.exp(img)-np.exp(img_true), x_star, [],
+            title=f'fit - truth (step {step+1})',
+            diff=True,
+            exp=True
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'rho_diff_nostars_step{step+1:05d}')
+        )
+        plt.close(fig)
+    return plot_callback
+
+
 def main():
-    fig_dir = 'plots_test/'
+    fig_dir = 'plots_test_onion_gamma36to18_w15_lrhigh/'
+    #fig_dir = 'plots_fs_nophase_t80_o10_g18_w20to30_n128k_b8k_ep128_tol75/'
     seed_mock, seed_fit, seed_tf = 17, 31, 101 # Fix psuedorandom seeds
 
     tf.random.set_seed(seed_tf)
 
     # Generate mock data
     print('Generating mock data ...')
-    n_stars = 1024 * 512
+    n_stars = 1024 * 128
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
-        40, n_stars,
+        80, n_stars,
         sigma_A=0.1,
         k_slope=1.8,
         batch_size=8*1024,
@@ -487,6 +869,12 @@ def main():
     A_true = A_true[:4096]
     A_obs = A_obs[:4096]
 
+    fig = plot_modes(log_rho_true, title='Fourier space (truth)', gamma=1.8)
+    fig.savefig(os.path.join(fig_dir, 'fourier_true'))
+    plt.close(fig)
+    fig = plot_power(log_rho_true, gamma=1.8, title='power (truth)')
+    fig.savefig(os.path.join(fig_dir, f'power_true'))
+    plt.close(fig)
     img_true = calc_image(log_rho_true)
     fig = plot_lnrho_A(img_true, x_star, A_true, title='truth')
     fig.savefig(os.path.join(fig_dir, 'ln_rho_true'))
@@ -499,10 +887,12 @@ def main():
     plt.close(fig)
 
     # Initialize model
-    log_rho_fit = HarmonicExpansion2D(
-        40,
-        extent=[10,10],
+    log_rho_fit = FourierSeriesND(
+        2, 20,
+        extent=10,
         k_slope=6,
+        sigma=0.1,
+        phase_form=False,
         seed=seed_fit
     )
 
@@ -510,53 +900,93 @@ def main():
     print(f'{n_trainable} trainable variables.')
 
     # Optimize model
-    plot_every = 32
-
-    def plot_callback(step):
-        if (step % plot_every != plot_every-1) and (step != -1):
-            return
-        img = calc_image(log_rho_fit)
-        A = calc_A(log_rho_fit, x_star)
-        fig = plot_lnrho_A(img, x_star, A, title=f'fit (step {step+1})')
-        fig.savefig(os.path.join(fig_dir, f'ln_rho_fit_stars_step{step+1:05d}'))
-        plt.close(fig)
-        fig = plot_lnrho_A(img, x_star, [], title=f'fit (step {step+1})')
-        fig.savefig(os.path.join(fig_dir, f'ln_rho_fit_nostars_step{step+1:05d}'))
-        plt.close(fig)
-        fig = plot_lnrho_A(np.exp(img), x_star, [], title=f'fit (step {step+1})', exp=True)
-        fig.savefig(os.path.join(fig_dir, f'rho_fit_nostars_step{step+1:05d}'))
-        plt.close(fig)
-        fig = plot_lnrho_A(
-            img-img_true, x_star, A-A_true,
-            title=f'fit - truth (step {step+1})',
-            diff=True
-        )
-        fig.savefig(os.path.join(fig_dir, f'ln_rho_diff_stars_step{step+1:05d}'))
-        plt.close(fig)
-        fig = plot_lnrho_A(
-            img-img_true, x_star, [],
-            title=f'fit - truth (step {step+1})',
-            diff=True
-        )
-        fig.savefig(os.path.join(fig_dir, f'ln_rho_diff_nostars_step{step+1:05d}'))
-        plt.close(fig)
-        fig = plot_lnrho_A(
-            np.exp(img)-np.exp(img_true), x_star, [],
-            title=f'fit - truth (step {step+1})',
-            diff=True,
-            exp=True
-        )
-        fig.savefig(os.path.join(fig_dir, f'rho_diff_nostars_step{step+1:05d}'))
-        plt.close(fig)
-
+    plot_callback = get_training_callback(
+        log_rho_fit,
+        x_star, A_true,
+        img_true,
+        fig_dir,
+        plot_every=32
+    )
     plot_callback(-1)
 
     batch_size = 1024 * 8
-    n_epochs = 16
+    n_epochs = 256
     history = train(
         log_rho_fit, dataset,
         n_stars, batch_size, n_epochs,
+        gamma0=3.6, gamma1=3.6,
+        log_w0=-1.0, log_w1=-1.5,
         callback=plot_callback
+    )
+
+    log_rho_fit_hq = FourierSeriesND(
+        2, 40,
+        extent=10,
+        k_slope=6,
+        sigma=0.1,
+        phase_form=False,
+        seed=seed_fit
+    )
+    log_rho_fit_hq.copy_modes(log_rho_fit)
+    log_rho_fit = log_rho_fit_hq
+    n_trainable = sum([tf.size(v) for v in log_rho_fit.trainable_variables])
+    print(f'{n_trainable} trainable variables.')
+    plot_callback = get_training_callback(
+        log_rho_fit,
+        x_star, A_true,
+        img_true,
+        fig_dir,
+        plot_every=32
+    )
+    n_steps = (n_stars // batch_size) * n_epochs
+    history = train(
+        log_rho_fit, dataset,
+        n_stars, batch_size, n_epochs,
+        lr0=5e-4, lr1=1e-5, n_lr_drops=6,
+        #log_w0=-3, log_w1=-3,
+        gamma0=3.6, gamma1=2.7,
+        log_w0=-1.5, log_w1=-1.5,
+        callback=lambda step: plot_callback(step+n_steps)
+    )
+
+    log_rho_fit_hq = FourierSeriesND(
+        2, 80,
+        extent=10,
+        k_slope=6,
+        sigma=0.1,
+        phase_form=False,
+        seed=seed_fit
+    )
+    log_rho_fit_hq.copy_modes(log_rho_fit)
+    log_rho_fit = log_rho_fit_hq
+    n_trainable = sum([tf.size(v) for v in log_rho_fit.trainable_variables])
+    print(f'{n_trainable} trainable variables.')
+    plot_callback = get_training_callback(
+        log_rho_fit,
+        x_star, A_true,
+        img_true,
+        fig_dir,
+        plot_every=32
+    )
+    n_steps = (n_stars // batch_size) * n_epochs
+    history = train(
+        log_rho_fit, dataset,
+        n_stars, batch_size, n_epochs,
+        lr0=1e-4, lr1=1e-5, n_lr_drops=6,
+        #log_w0=-3, log_w1=-3,
+        gamma0=2.7, gamma1=1.8,
+        log_w0=-1.5, log_w1=-1.5,
+        callback=lambda step: plot_callback(step+2*n_steps)
+    )
+
+    n_steps = (n_stars // batch_size) * (n_epochs//2)
+    history = train(
+        log_rho_fit, dataset,
+        n_stars, batch_size, n_epochs//2,
+        lr0=1e-4, lr1=1e-6, n_lr_drops=9,
+        gamma0=1.8, gamma1=1.8,
+        log_w0=-1.5, log_w1=-1.5,
+        callback=lambda step: plot_callback(step+2*n_steps)
     )
 
     img_fit = calc_image(log_rho_fit)
