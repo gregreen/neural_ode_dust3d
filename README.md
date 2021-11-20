@@ -21,10 +21,10 @@ is parameterized. This is the approach that this project takes as well.
 # Neural ODEs
 
 This project takes a very straightforward approach to finding the maximum-posterior model of the
-dust density field. Neural ordinary differential equations (ODEs) are a general approach to
-integrating ODEs that involve auto-differentiable functions (such as neural networks), and then
-calculating the gradient of the results with respect to free parameters in the ODE (such as
-neural network weights).
+dust density field. Neural ordinary differential equations
+([Chen+2018](https://arxiv.org/abs/1806.07366)) are a general approach to integrating ODEs that
+involve auto-differentiable functions (such as neural networks), and then calculating the gradient
+of the results with respect to free parameters in the ODE (such as neural network weights).
 
 In this project, neural ODEs are used to calculate line integrals through
 the dust density field. In this way, we can calculate the extinctions of a set of stars, and their
