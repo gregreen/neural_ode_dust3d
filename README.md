@@ -31,7 +31,7 @@ the dust density field. In this way, we can calculate the extinctions of a set o
 gradients with respect to the model parameters. This allows us to calculate the gradient of the
 likelihood with respect to the model parameters. If the prior is also formulated as an
 auto-differentiable function, then we can calculate the gradients of the posterior distribution as
-well. We can begin with a guess of dust density model paramters, and then use standard
+well. We can begin with a guess of dust density model parameters, and then use standard
 gradient-descent algorithms to maximize the posterior density. Given that we often work with very
 large numbers of stars, we can use *batched* stochastic gradient descent.
 
