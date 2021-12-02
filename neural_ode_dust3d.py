@@ -839,7 +839,7 @@ def get_training_callback(log_rho_fit, x_star, A_true,
 
 
 def main():
-    fig_dir = 'plots_test_onion_gamma36to18_w15_lrhigh/'
+    fig_dir = 'plots_test_onion_gamma36to18_w15_lrhigh2/'
     #fig_dir = 'plots_fs_nophase_t80_o10_g18_w20to30_n128k_b8k_ep128_tol75/'
     seed_mock, seed_fit, seed_tf = 17, 31, 101 # Fix psuedorandom seeds
 
@@ -918,6 +918,9 @@ def main():
         log_w0=-1.0, log_w1=-1.5,
         callback=plot_callback
     )
+    fig = plot_loss(history)
+    fig.savefig(os.path.join(fig_dir, 'loss_history_0'))
+    plt.close(fig)
 
     log_rho_fit_hq = FourierSeriesND(
         2, 40,
@@ -948,6 +951,9 @@ def main():
         log_w0=-1.5, log_w1=-1.5,
         callback=lambda step: plot_callback(step+n_steps)
     )
+    fig = plot_loss(history)
+    fig.savefig(os.path.join(fig_dir, 'loss_history_1'))
+    plt.close(fig)
 
     log_rho_fit_hq = FourierSeriesND(
         2, 80,
@@ -978,15 +984,18 @@ def main():
         log_w0=-1.5, log_w1=-1.5,
         callback=lambda step: plot_callback(step+2*n_steps)
     )
+    fig = plot_loss(history)
+    fig.savefig(os.path.join(fig_dir, 'loss_history_2'))
+    plt.close(fig)
 
-    n_steps = (n_stars // batch_size) * (n_epochs//2)
+    n_steps = (n_stars // batch_size) * n_epochs
     history = train(
         log_rho_fit, dataset,
         n_stars, batch_size, n_epochs//2,
-        lr0=1e-4, lr1=1e-6, n_lr_drops=9,
+        lr0=1e-4, lr1=5e-7, n_lr_drops=9,
         gamma0=1.8, gamma1=1.8,
         log_w0=-1.5, log_w1=-1.5,
-        callback=lambda step: plot_callback(step+2*n_steps)
+        callback=lambda step: plot_callback(step+3*n_steps)
     )
 
     img_fit = calc_image(log_rho_fit)
