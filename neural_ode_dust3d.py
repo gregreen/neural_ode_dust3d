@@ -384,7 +384,9 @@ def plot_power(model, gamma=None, title=None):
     return fig
 
 
-def plot_lnrho_A(img, x_star, A_star, title='', diff=False, exp=False):
+def plot_lnrho_A(img, x_star, A_star,
+                 title='', diff=False, exp=False,
+                 z=0., dz=0.1):
     fig,ax_arr = plt.subplots(
         2,2,
         figsize=(6,6),
@@ -430,6 +432,13 @@ def plot_lnrho_A(img, x_star, A_star, title='', diff=False, exp=False):
     n_stars = len(A_star)
 
     if n_stars:
+        # If 3D, then only plot stars in a thin plane in z
+        n_dim = x_star.shape[1]
+        if n_dim == 3:
+            idx = np.abs(x_star[:,2] - z) < dz
+            x_star = x_star[idx]
+            A_star = A_star[idx]
+
         if diff:
             vmax = 1.2 * np.percentile(np.abs(A_star), 98)
             kw = dict(vmin=-vmax, vmax=vmax, edgecolors='w', linewidths=0.5)
@@ -442,7 +451,7 @@ def plot_lnrho_A(img, x_star, A_star, title='', diff=False, exp=False):
             x_star[:,0],
             x_star[:,1],
             c=A_star,
-            s=16 / max(np.sqrt(n_stars/1024), 1),
+            s=36 / max(np.sqrt(n_stars/1024), 1),
             cmap='coolwarm',
             **kw
         )
@@ -601,28 +610,32 @@ def train(log_rho_fit, dataset,
     return history
 
 
-def gen_mock_data(max_order, n_stars,
-                  sigma_A=0, k_slope=4,
+def gen_mock_data(max_order, n_stars, n_dim,
+                  sigma_A=0, k_slope=4, extent=10,
                   batch_size=1024, seed=None):
-    #log_rho = HarmonicExpansion2D(
-    #    max_order,
-    #    extent=[10,10],
-    #    k_slope=k_slope,
-    #    seed=seed
-    #)
+    # Generate log(rho) field
     log_rho = FourierSeriesND(
-        2,
+        n_dim,
         max_order,
-        extent=10,
+        extent=extent,
         k_slope=k_slope,
         seed=seed
     )
 
+    # Draw stellar positions
     if seed is not None:
         seed = 2 * seed + 1 # Use different seed for locations of stars
-    rng = np.random.default_rng(seed)
-    x_star = rng.uniform(-8, 8, size=(n_stars,2)).astype('f4')
 
+    rng = np.random.default_rng(seed)
+
+    x_star = rng.uniform(-1, 1, size=(n_stars,n_dim)).astype('f4')
+    if hasattr(extent, '__len__'):
+        for k,w in enumerate(extent):
+            x_star[:,k] *= 0.8*w
+    else:
+        x_star *= 0.8*extent
+
+    # Calculate stellar extinctions
     A = np.empty(n_stars, dtype='f4')
 
     @tf.function
@@ -631,21 +644,27 @@ def gen_mock_data(max_order, n_stars,
 
     for i in tqdm(range(0,n_stars,batch_size)):
         A[i:i+batch_size] = calc_A_batch(x_star[i:i+batch_size]).numpy()
-        #A[i:i+batch_size] = calc_A(log_rho, x_star[i:i+batch_size]).numpy()
 
+    # Add noise into the stellar extinctions
     A_obs = A + sigma_A * rng.normal(size=A.shape).astype('f4')
 
     return log_rho, x_star, A, A_obs
 
 
-def calc_image(log_rho):
+def calc_image(log_rho, n_dim, z=0.):
     x_grid = np.linspace(-10, 10, 200, dtype='f4')
     x_grid,y_grid = np.meshgrid(x_grid,x_grid)
     shape = x_grid.shape
-    xy_grid = np.stack([x_grid, y_grid], axis=2)
-    xy_grid.shape = (np.prod(shape), 2)
+    if n_dim == 2:
+        coord_grid = np.stack([x_grid, y_grid], axis=2)
+    elif n_dim == 3:
+        coord_grid = np.stack(
+            [x_grid, y_grid, np.full(x_grid.shape,z,dtype='f4')],
+            axis=2
+        )
+    coord_grid.shape = (-1, n_dim)
 
-    img = log_rho(xy_grid).numpy()
+    img = log_rho(coord_grid).numpy()
     img.shape = shape
 
     return img
@@ -675,13 +694,13 @@ def plot_loss(history):
     ax_u.plot(history['ln_chi2'], alpha=0.5, label=r'$\ln \chi^2$')
 
     ax_u.plot([], [], alpha=0.5, label='prior') # dummy plot, for legend
-    ax_u.set_ylabel(r'loss, $\ln \chi^2$')
+    ax_u.set_ylabel(r'$\mathrm{loss}$, $\ln \chi^2$')
 
     ax2 = ax_u.twinx()
     for i in range(2):
         ax2.plot([],[]) # dummy plots, to cycle colors on ax2
     ax2.plot(history['prior'], alpha=0.5)
-    ax2.set_ylabel(r'prior')
+    ax2.set_ylabel(r'$\mathrm{prior}$')
 
     ax_l.plot(
         history['norm'],
@@ -690,17 +709,17 @@ def plot_loss(history):
     ax_l.set_ylabel(r'$\left|\nabla\left(\mathrm{loss}\right)\right|$')
 
     if 'n_eval' in history:
-        ax_l.plot([], [], label='# evaluations') # dummy
+        ax_l.plot([], [], label=r'$\mathrm{\#\ evaluations}$') # dummy
         ax2 = ax_l.twinx()
         ax2.plot([], []) # dummy
         ax2.plot(history['n_eval'])
-        ax2.set_ylabel(r'# evaluations')
+        ax2.set_ylabel(r'$\mathrm{\#\ evaluations}$')
 
     ax_u.legend(loc='upper right')
     ax_l.legend(loc='center right')
 
-    ax_l.set_xlabel('training step')
-    ax_u.set_title('training history')
+    ax_l.set_xlabel(r'$\mathrm{training\ step}$')
+    ax_u.set_title(r'$\mathrm{training\ history}$')
 
     ax_u.set_xticklabels([])
 
@@ -765,7 +784,7 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
 
 
 def get_training_callback(log_rho_fit, x_star, A_true,
-                          img_true, fig_dir, plot_every=16):
+                          img_true, fig_dir, n_dim, plot_every=16):
     def plot_callback(step):
         if (step % plot_every != plot_every-1) and (step != -1):
             return
@@ -787,7 +806,7 @@ def get_training_callback(log_rho_fit, x_star, A_true,
             os.path.join(fig_dir, f'power_step{step+1:05d}')
         )
         plt.close(fig)
-        img = calc_image(log_rho_fit)
+        img = calc_image(log_rho_fit, n_dim)
         A = calc_A(log_rho_fit, x_star)
         fig = plot_lnrho_A(img, x_star, A, title=f'fit (step {step+1})')
         fig.savefig(
@@ -839,8 +858,8 @@ def get_training_callback(log_rho_fit, x_star, A_true,
 
 
 def main():
-    fig_dir = 'plots_test_onion_gamma36to18_w15_lrhigh2/'
-    #fig_dir = 'plots_fs_nophase_t80_o10_g18_w20to30_n128k_b8k_ep128_tol75/'
+    fig_dir = 'plots_test_3d_v2'
+    n_dim = 3
     seed_mock, seed_fit, seed_tf = 17, 31, 101 # Fix psuedorandom seeds
 
     tf.random.set_seed(seed_tf)
@@ -849,7 +868,8 @@ def main():
     print('Generating mock data ...')
     n_stars = 1024 * 128
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
-        80, n_stars,
+        [40,40,8], n_stars, n_dim,
+        extent=[10,10,2],
         sigma_A=0.1,
         k_slope=1.8,
         batch_size=8*1024,
@@ -865,9 +885,10 @@ def main():
     print(f'      prior = {prior_true:.5f}')
 
     # For plotting, only keep a subset of stars
-    x_star = x_star[:4096]
-    A_true = A_true[:4096]
-    A_obs = A_obs[:4096]
+    n_plot = 1024*16
+    x_star = x_star[:n_plot]
+    A_true = A_true[:n_plot]
+    A_obs = A_obs[:n_plot]
 
     fig = plot_modes(log_rho_true, title='Fourier space (truth)', gamma=1.8)
     fig.savefig(os.path.join(fig_dir, 'fourier_true'))
@@ -875,7 +896,7 @@ def main():
     fig = plot_power(log_rho_true, gamma=1.8, title='power (truth)')
     fig.savefig(os.path.join(fig_dir, f'power_true'))
     plt.close(fig)
-    img_true = calc_image(log_rho_true)
+    img_true = calc_image(log_rho_true, n_dim)
     fig = plot_lnrho_A(img_true, x_star, A_true, title='truth')
     fig.savefig(os.path.join(fig_dir, 'ln_rho_true'))
     plt.close(fig)
@@ -888,8 +909,8 @@ def main():
 
     # Initialize model
     log_rho_fit = FourierSeriesND(
-        2, 20,
-        extent=10,
+        n_dim, [10,10,2],
+        extent=[10,10,2],
         k_slope=6,
         sigma=0.1,
         phase_form=False,
@@ -905,12 +926,13 @@ def main():
         x_star, A_true,
         img_true,
         fig_dir,
+        n_dim,
         plot_every=32
     )
     plot_callback(-1)
 
-    batch_size = 1024 * 8
-    n_epochs = 256
+    batch_size = 1024 * 4
+    n_epochs = 64#256
     history = train(
         log_rho_fit, dataset,
         n_stars, batch_size, n_epochs,
@@ -923,8 +945,8 @@ def main():
     plt.close(fig)
 
     log_rho_fit_hq = FourierSeriesND(
-        2, 40,
-        extent=10,
+        n_dim, [20,20,4],
+        extent=[10,10,2],
         k_slope=6,
         sigma=0.1,
         phase_form=False,
@@ -939,6 +961,7 @@ def main():
         x_star, A_true,
         img_true,
         fig_dir,
+        n_dim,
         plot_every=32
     )
     n_steps = (n_stars // batch_size) * n_epochs
@@ -956,8 +979,8 @@ def main():
     plt.close(fig)
 
     log_rho_fit_hq = FourierSeriesND(
-        2, 80,
-        extent=10,
+        n_dim, [40,40,8],
+        extent=[10,10,2],
         k_slope=6,
         sigma=0.1,
         phase_form=False,
@@ -972,6 +995,7 @@ def main():
         x_star, A_true,
         img_true,
         fig_dir,
+        n_dim,
         plot_every=32
     )
     n_steps = (n_stars // batch_size) * n_epochs
@@ -998,7 +1022,7 @@ def main():
         callback=lambda step: plot_callback(step+3*n_steps)
     )
 
-    img_fit = calc_image(log_rho_fit)
+    img_fit = calc_image(log_rho_fit, n_dim)
     A_fit = calc_A(log_rho_fit, x_star)
     fig = plot_lnrho_A(img_fit, x_star, A_fit, title='fit')
     fig.savefig(os.path.join(fig_dir, 'ln_rho_fit'))
