@@ -726,7 +726,7 @@ def plot_sky(log_rho, dist, extent, A_reference=None,
 
     # Plot extinction over sky
     def make_fig(A, kw, label):
-        fig = plt.figure(figsize=(6,3))
+        fig = plt.figure(figsize=(6,2.5))
         fig.suptitle(title)
         ax,im = plot_healpix_map(fig, A, imshow_kwargs=kw)
         fig.colorbar(im, ax=ax, label=label)
@@ -949,7 +949,7 @@ def get_training_callback(log_rho_fit, A_sky_true, x_star, A_true,
 
 
 def main():
-    fig_dir = 'plots_test_3d_v3'
+    fig_dir = 'plots_test_3d_v4'
     n_dim = 3
     extent = [10, 10, 2]
     seed_mock, seed_fit, seed_tf = 17, 31, 101 # Fix psuedorandom seeds
@@ -958,7 +958,7 @@ def main():
 
     # Generate mock data
     print('Generating mock data ...')
-    n_stars = 1024 * 128
+    n_stars = 1024 * 1024
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
         [40,40,8], n_stars, n_dim,
         extent=extent,
@@ -1034,12 +1034,12 @@ def main():
         fig_dir,
         n_dim,
         extent,
-        plot_every=32
+        plot_every=16
     )
     plot_callback(-1)
 
     batch_size = 1024 * 4
-    n_epochs = 64#256
+    n_epochs = 16#256
     history = train(
         log_rho_fit, dataset,
         n_stars, batch_size, n_epochs,
@@ -1071,7 +1071,7 @@ def main():
         fig_dir,
         n_dim,
         extent,
-        plot_every=32
+        plot_every=16
     )
     n_steps = (n_stars // batch_size) * n_epochs
     history = train(
@@ -1107,7 +1107,7 @@ def main():
         fig_dir,
         n_dim,
         extent,
-        plot_every=32
+        plot_every=16
     )
     n_steps = (n_stars // batch_size) * n_epochs
     history = train(
