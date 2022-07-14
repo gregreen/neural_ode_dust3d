@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 plt.style.use('dark_background')
 from matplotlib import ticker
+from matplotlib.colors import CenteredNorm
 
 import tensorflow as tf
 import tensorflow.keras as keras
@@ -16,6 +17,10 @@ import sonnet as snt
 import itertools
 from tqdm import tqdm
 import os
+
+from astropy_healpix import HEALPix
+
+from skyplot_utils import plot_healpix_map
 
 
 class FourierSeriesND(snt.Module):
@@ -687,6 +692,59 @@ def calc_A(log_rho, x_star):
     return A
 
 
+def plot_sky(log_rho, dist, extent, A_reference=None,
+             nside=64, batch_size=1024, title=''):
+    @tf.function
+    def calc_A_batch(x):
+        return calc_A(log_rho, x)
+
+    # Create grid of points to plot
+    hpx = HEALPix(nside=nside, order='nested')
+    lon,lat = hpx.healpix_to_lonlat(np.arange(hpx.npix))
+    lon = lon.to('rad').value
+    lat = lat.to('rad').value
+    x_sky = np.empty((lon.size, 3), dtype='f4')
+    x_sky[:,0] = np.cos(lon) * np.cos(lat)
+    x_sky[:,1] = np.sin(lon) * np.cos(lat)
+    x_sky[:,2] = np.sin(lat)
+    x_sky *= dist
+    #The following line works in the dev version of astropy_healpix
+    #x_sky = dist * np.stack(hpx.healpix_to_xyz(np.arange(hpx.npix)), axis=1)
+
+    # Limit grid-point distances to fall within given extent
+    if not hasattr(extent, '__len__'):
+        extent = [extent]*3
+    for k,w in enumerate(extent):
+        x_sky *= np.clip(extent[k]/np.abs(x_sky[:,k]), 0., 1.)[:,None]
+
+    # Calculate extinctions at sky locations (at given distance)
+    A_sky = np.empty(hpx.npix, dtype='f4')
+
+    print('Calculating extinction over sky ...')
+    for i in tqdm(range(0,hpx.npix,batch_size)):
+        A_sky[i:i+batch_size] = calc_A_batch(x_sky[i:i+batch_size]).numpy()
+
+    # Plot extinction over sky
+    def make_fig(A, kw, label):
+        fig = plt.figure(figsize=(6,2.5))
+        fig.suptitle(title)
+        ax,im = plot_healpix_map(fig, A, imshow_kwargs=kw)
+        fig.colorbar(im, ax=ax, label=label)
+        return fig
+
+    figs = make_fig(A_sky, {}, rf'$A \left(r={dist:.1f}\right)$')
+
+    if A_reference is not None:
+        kw = dict(
+            cmap='coolwarm',
+            norm=CenteredNorm()
+        )
+        label = rf'$\Delta A \left(r={dist:.1f}\right)$'
+        figs = [figs, make_fig(A_sky-A_reference, kw, label)]
+
+    return figs, A_sky
+
+
 def plot_loss(history):
     fig,(ax_u,ax_l) = plt.subplots(2,1, figsize=(6,6))
 
@@ -783,11 +841,44 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
     return calc_loss
 
 
-def get_training_callback(log_rho_fit, x_star, A_true,
-                          img_true, fig_dir, n_dim, plot_every=16):
+def get_training_callback(log_rho_fit, A_sky_true, x_star, A_true,
+                          img_true, fig_dir, n_dim, extent,
+                          plot_every=16):
     def plot_callback(step):
         if (step % plot_every != plot_every-1) and (step != -1):
             return
+        figs,_ = plot_sky(
+            log_rho_fit,
+            min(extent),
+            extent,
+            A_reference=A_sky_true[0],
+            nside=32,
+            title=f'fit (step {step+1})'
+        )
+        figs[0].savefig(
+            os.path.join(fig_dir, f'A_sky_close_fit_step{step+1:05d}')
+        )
+        plt.close(figs[0])
+        figs[1].savefig(
+            os.path.join(fig_dir, f'A_sky_close_diff_step{step+1:05d}')
+        )
+        plt.close(figs[1])
+        figs,_ = plot_sky(
+            log_rho_fit,
+            0.8*max(extent),
+            extent,
+            A_reference=A_sky_true[1],
+            nside=32,
+            title=f'fit (step {step+1})'
+        )
+        figs[0].savefig(
+            os.path.join(fig_dir, f'A_sky_far_fit_step{step+1:05d}')
+        )
+        plt.close(figs[0])
+        figs[1].savefig(
+            os.path.join(fig_dir, f'A_sky_far_diff_step{step+1:05d}')
+        )
+        plt.close(figs[1])
         fig = plot_modes(
             log_rho_fit,
             gamma=1.8,
@@ -858,18 +949,19 @@ def get_training_callback(log_rho_fit, x_star, A_true,
 
 
 def main():
-    fig_dir = 'plots_test_3d_v2'
+    fig_dir = 'plots_test_3d_v4'
     n_dim = 3
+    extent = [10, 10, 2]
     seed_mock, seed_fit, seed_tf = 17, 31, 101 # Fix psuedorandom seeds
 
     tf.random.set_seed(seed_tf)
 
     # Generate mock data
     print('Generating mock data ...')
-    n_stars = 1024 * 128
+    n_stars = 1024 * 1024
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
         [40,40,8], n_stars, n_dim,
-        extent=[10,10,2],
+        extent=extent,
         sigma_A=0.1,
         k_slope=1.8,
         batch_size=8*1024,
@@ -890,6 +982,19 @@ def main():
     A_true = A_true[:n_plot]
     A_obs = A_obs[:n_plot]
 
+    fig,A_sky_close_true = plot_sky(
+        log_rho_true, min(extent), extent,
+        nside=32, title='truth'
+    )
+    fig.savefig(os.path.join(fig_dir, 'A_sky_close_true'))
+    plt.close(fig)
+    fig,A_sky_far_true = plot_sky(
+        log_rho_true, 0.8*max(extent), extent,
+        nside=32, title='truth'
+    )
+    fig.savefig(os.path.join(fig_dir, 'A_sky_far_true'))
+    plt.close(fig)
+    A_sky_true = [A_sky_close_true, A_sky_far_true]
     fig = plot_modes(log_rho_true, title='Fourier space (truth)', gamma=1.8)
     fig.savefig(os.path.join(fig_dir, 'fourier_true'))
     plt.close(fig)
@@ -910,7 +1015,7 @@ def main():
     # Initialize model
     log_rho_fit = FourierSeriesND(
         n_dim, [10,10,2],
-        extent=[10,10,2],
+        extent=extent,
         k_slope=6,
         sigma=0.1,
         phase_form=False,
@@ -923,16 +1028,18 @@ def main():
     # Optimize model
     plot_callback = get_training_callback(
         log_rho_fit,
+        A_sky_true,
         x_star, A_true,
         img_true,
         fig_dir,
         n_dim,
-        plot_every=32
+        extent,
+        plot_every=16
     )
     plot_callback(-1)
 
     batch_size = 1024 * 4
-    n_epochs = 64#256
+    n_epochs = 16#256
     history = train(
         log_rho_fit, dataset,
         n_stars, batch_size, n_epochs,
@@ -946,7 +1053,7 @@ def main():
 
     log_rho_fit_hq = FourierSeriesND(
         n_dim, [20,20,4],
-        extent=[10,10,2],
+        extent=extent,
         k_slope=6,
         sigma=0.1,
         phase_form=False,
@@ -958,11 +1065,13 @@ def main():
     print(f'{n_trainable} trainable variables.')
     plot_callback = get_training_callback(
         log_rho_fit,
+        A_sky_true,
         x_star, A_true,
         img_true,
         fig_dir,
         n_dim,
-        plot_every=32
+        extent,
+        plot_every=16
     )
     n_steps = (n_stars // batch_size) * n_epochs
     history = train(
@@ -980,7 +1089,7 @@ def main():
 
     log_rho_fit_hq = FourierSeriesND(
         n_dim, [40,40,8],
-        extent=[10,10,2],
+        extent=extent,
         k_slope=6,
         sigma=0.1,
         phase_form=False,
@@ -992,11 +1101,13 @@ def main():
     print(f'{n_trainable} trainable variables.')
     plot_callback = get_training_callback(
         log_rho_fit,
+        A_sky_true,
         x_star, A_true,
         img_true,
         fig_dir,
         n_dim,
-        plot_every=32
+        extent,
+        plot_every=16
     )
     n_steps = (n_stars // batch_size) * n_epochs
     history = train(

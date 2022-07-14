@@ -8,18 +8,33 @@ plot_mode="${PLOTMODE:=rho}"
 if [ ${plot_mode} = "rho" ]; then
   prefix1="rho_fit_nostars"
   prefix2="rho_diff_nostars"
+  stackmode="h"
 elif [ ${plot_mode} = "stars" ]; then
   prefix1="ln_rho_fit_stars"
   prefix2="ln_rho_diff_stars"
+  stackmode="h"
 elif [ ${plot_mode} = "fourier" ]; then
   prefix1="fourier"
   prefix2="power"
+  stackmode="h"
+elif [ ${plot_mode} = "sky_close" ]; then
+  prefix1="A_sky_close_fit"
+  prefix2="A_sky_close_diff"
+  stackmode="v"
+elif [ ${plot_mode} = "sky_far" ]; then
+  prefix1="A_sky_far_fit"
+  prefix2="A_sky_far_diff"
+  stackmode="v"
 else
   echo "Unrecognized PLOTMODE: ${PLOTMODE}"
   return 1
 fi
 
-echo ${plot_mode}
+if [ ${stackmode} = "v" ]; then
+  height=$(( ${height} / 2 ));
+fi
+
+echo "plot mode: ${plot_mode}"
 
 ffmpeg \
   -y \
@@ -32,7 +47,7 @@ ffmpeg \
   -filter_complex " \
     [0:v] setpts=PTS-STARTPTS, scale=-1:${height} [a0]; \
     [1:v] setpts=PTS-STARTPTS, scale=-1:${height} [a1]; \
-    [a0][a1]hstack=inputs=2[out] \
+    [a0][a1]${stackmode}stack=inputs=2[out] \
     " \
   -map "[out]" \
   -c:v libx264 \
