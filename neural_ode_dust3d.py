@@ -17,6 +17,7 @@ import sonnet as snt
 import itertools
 from tqdm import tqdm
 import os
+import json
 
 from astropy_healpix import HEALPix
 
@@ -497,6 +498,11 @@ def train(log_rho_fit, dataset,
           lr0=1e-3, lr1=1e-6, n_lr_drops=9,
           log_w0=-2, log_w1=-3,
           gamma0=1.8, gamma1=1.8,
+          checkpoint_every=1,
+          checkpoint_hours=1,
+          max_checkpoints=16,
+          checkpoint_dir=r'checkpoints',
+          checkpoint_name='log_rho',
           callback=None):
     # Break the dataset up into batches
     dataset_batches = dataset.shuffle(
@@ -580,9 +586,42 @@ def train(log_rho_fit, dataset,
         'n_eval': []
     }
 
+    # Step counter (needed for checkpointing)
+    step = tf.Variable(0, name='step')
+    checkpoint_steps = int(np.ceil(checkpoint_every * n_stars / batch_size))
+
+    # Checkpointer
+    checkpoint = tf.train.Checkpoint(log_rho=log_rho_fit, opt=opt, step=step)
+    chkpt_manager = tf.train.CheckpointManager(
+        checkpoint,
+        directory=checkpoint_dir,
+        checkpoint_name=checkpoint_name,
+        max_to_keep=max_checkpoints,
+        keep_checkpoint_every_n_hours=checkpoint_hours
+    )
+
+    # Look for latest existing checkpoint
+    latest = chkpt_manager.latest_checkpoint
+    if latest is not None:
+        print(f'Restoring from checkpoint {latest} ...')
+        checkpoint.restore(latest)
+        print(f'Beginning from step {int(step)}.')
+
+        # Try to load stats history
+        history_fname = f'{latest}_stats.json'
+        with open(history_fname, 'r') as f:
+            history = json.load(f)
+
     # Take gradient-descent steps on training batches
-    step_iter = tqdm(enumerate(dataset_batches), total=n_steps)
+    step_iter = tqdm(
+        enumerate(dataset_batches, int(step)),
+        initial=int(step),
+        total=n_steps
+    )
     for i,(A_obs,x_star) in step_iter:
+        if i >= n_steps:
+            break
+
         prior_weight = get_prior_weight(i)
         gamma = get_gamma(i)
         loss, A_fit, ln_chi2, prior, norm, n_eval = grad_step(
@@ -606,6 +645,17 @@ def train(log_rho_fit, dataset,
             'gamma': float(gamma),
             'weight': float(prior_weight)
         })
+
+        # Checkpoint
+        if (checkpoint_every is not None) and i and not (i % checkpoint_steps):
+            print('Checkpointing ...')
+            step.assign(i+1)
+            chkpt_fname = chkpt_manager.save()
+            print(f'  --> {chkpt_fname}')
+
+            history_fname = f'{chkpt_fname}_stats.json'
+            with open(history_fname, 'w') as f:
+                json.dump(history, f)
 
         # Call the given callback function, which may, for example, plot
         # the current ln(rho) field
@@ -656,7 +706,7 @@ def gen_mock_data(max_order, n_stars, n_dim,
     return log_rho, x_star, A, A_obs
 
 
-def calc_image(log_rho, n_dim, z=0.):
+def calc_image(log_rho, n_dim, z=0., batch_size=2048):
     x_grid = np.linspace(-10, 10, 200, dtype='f4')
     x_grid,y_grid = np.meshgrid(x_grid,x_grid)
     shape = x_grid.shape
@@ -669,7 +719,16 @@ def calc_image(log_rho, n_dim, z=0.):
         )
     coord_grid.shape = (-1, n_dim)
 
-    img = log_rho(coord_grid).numpy()
+    @tf.function
+    def calc_rho_batch(x):
+        return log_rho(x)
+
+    img = np.empty(coord_grid.shape[0], dtype='f4')
+    for i in tqdm(range(0,coord_grid.shape[0],batch_size)):
+        img[i:i+batch_size] = calc_rho_batch(
+            coord_grid[i:i+batch_size]
+        ).numpy().flat
+    #img = log_rho(coord_grid).numpy()
     img.shape = shape
 
     return img
@@ -726,10 +785,11 @@ def plot_sky(log_rho, dist, extent, A_reference=None,
 
     # Plot extinction over sky
     def make_fig(A, kw, label):
-        fig = plt.figure(figsize=(6,2.5))
+        fig = plt.figure(figsize=(6,3.1))
         fig.suptitle(title)
         ax,im = plot_healpix_map(fig, A, imshow_kwargs=kw)
         fig.colorbar(im, ax=ax, label=label)
+        fig.subplots_adjust(left=0.05, right=0.98)
         return fig
 
     figs = make_fig(A_sky, {}, rf'$A \left(r={dist:.1f}\right)$')
@@ -948,11 +1008,11 @@ def get_training_callback(log_rho_fit, A_sky_true, x_star, A_true,
     return plot_callback
 
 
-def main():
-    fig_dir = 'plots_test_3d_v4'
+def run_mock():
+    fig_dir = 'plots'
     n_dim = 3
     extent = [10, 10, 2]
-    seed_mock, seed_fit, seed_tf = 17, 31, 101 # Fix psuedorandom seeds
+    seed_mock, seed_fit, seed_tf = 17, 31, 101 # Fix pseudorandom seeds
 
     tf.random.set_seed(seed_tf)
 
@@ -960,11 +1020,11 @@ def main():
     print('Generating mock data ...')
     n_stars = 1024 * 1024
     log_rho_true, x_star, A_true, A_obs = gen_mock_data(
-        [40,40,8], n_stars, n_dim,
+        [60,60,12], n_stars, n_dim,
         extent=extent,
         sigma_A=0.1,
         k_slope=1.8,
-        batch_size=8*1024,
+        batch_size=2*1024,
         seed=seed_mock
     )
     dataset = tf.data.Dataset.from_tensor_slices((A_obs,x_star))
@@ -1014,7 +1074,7 @@ def main():
 
     # Initialize model
     log_rho_fit = FourierSeriesND(
-        n_dim, [10,10,2],
+        n_dim, [15,15,3],
         extent=extent,
         k_slope=6,
         sigma=0.1,
@@ -1038,13 +1098,15 @@ def main():
     )
     plot_callback(-1)
 
-    batch_size = 1024 * 4
+    batch_size = 1024 * 2
     n_epochs = 16#256
     history = train(
         log_rho_fit, dataset,
         n_stars, batch_size, n_epochs,
         gamma0=3.6, gamma1=3.6,
         log_w0=-1.0, log_w1=-1.5,
+        checkpoint_name='log_rho',
+        checkpoint_dir='checkpoints_1',
         callback=plot_callback
     )
     fig = plot_loss(history)
@@ -1052,7 +1114,7 @@ def main():
     plt.close(fig)
 
     log_rho_fit_hq = FourierSeriesND(
-        n_dim, [20,20,4],
+        n_dim, [30,30,6],
         extent=extent,
         k_slope=6,
         sigma=0.1,
@@ -1081,6 +1143,8 @@ def main():
         #log_w0=-3, log_w1=-3,
         gamma0=3.6, gamma1=2.7,
         log_w0=-1.5, log_w1=-1.5,
+        checkpoint_name='log_rho',
+        checkpoint_dir='checkpoints_2',
         callback=lambda step: plot_callback(step+n_steps)
     )
     fig = plot_loss(history)
@@ -1088,7 +1152,7 @@ def main():
     plt.close(fig)
 
     log_rho_fit_hq = FourierSeriesND(
-        n_dim, [40,40,8],
+        n_dim, [60,60,12],
         extent=extent,
         k_slope=6,
         sigma=0.1,
@@ -1117,6 +1181,8 @@ def main():
         #log_w0=-3, log_w1=-3,
         gamma0=2.7, gamma1=1.8,
         log_w0=-1.5, log_w1=-1.5,
+        checkpoint_name='log_rho',
+        checkpoint_dir='checkpoints_3',
         callback=lambda step: plot_callback(step+2*n_steps)
     )
     fig = plot_loss(history)
@@ -1130,6 +1196,8 @@ def main():
         lr0=1e-4, lr1=5e-7, n_lr_drops=9,
         gamma0=1.8, gamma1=1.8,
         log_w0=-1.5, log_w1=-1.5,
+        checkpoint_name='log_rho',
+        checkpoint_dir='checkpoints_4',
         callback=lambda step: plot_callback(step+3*n_steps)
     )
 
@@ -1166,7 +1234,12 @@ def main():
     fig.savefig(os.path.join(fig_dir, 'loss_history'))
     plt.close(fig)
 
+
+def main():
+    run_mock()
+
     return 0
+
 
 if __name__ == '__main__':
     main()
