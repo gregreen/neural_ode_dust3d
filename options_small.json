@@ -1,0 +1,31 @@
+{
+  "extent": {
+    "stars": [1.0, 1.0, 0.3],
+    "box": [1.333333333, 1.333333333, 0.4]
+  },
+  "training_rounds": [
+    {
+      "n_modes": [10, 10, 3],
+      "batch_size": 16384,
+      "n_epochs": 1,
+      "gamma0": 1.8,
+      "gamma1": 1.8,
+      "log_w0": -1.0,
+      "log_w1": -1.5,
+      "checkpoint_every": 0.5
+    },
+    {
+      "n_modes": [20, 20, 6],
+      "batch_size": 4096,
+      "n_epochs": 1,
+      "lr0": 5e-4,
+      "lr1": 1e-5,
+      "n_lr_drops": 6,
+      "gamma0": 1.8,
+      "gamma1": 1.8,
+      "log_w0": -1.5,
+      "log_w1": -1.5,
+      "checkpoint_every": 0.2
+    }
+  ]
+}
