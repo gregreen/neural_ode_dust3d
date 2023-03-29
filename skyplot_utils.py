@@ -82,7 +82,7 @@ def plot_healpix_map(fig, m, size=1024,
         **imshow_kwargs
     )
 
-    ax.coords.grid(color='w', alpha=0.5)
+    ax.coords.grid(color='w', alpha=0.2)
     ax.coords['glon'].set_ticks_visible(False)
     ax.coords['glon'].set_ticklabel_visible(False)
     ax.coords['glat'].set_ticks_visible(False)

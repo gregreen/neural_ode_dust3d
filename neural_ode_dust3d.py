@@ -24,6 +24,60 @@ from astropy_healpix import HEALPix
 from skyplot_utils import plot_healpix_map
 
 
+class MultiComponentModel(snt.Module):
+    def __init__(self, *models):
+        super(MultiComponentModel, self).__init__()
+        self.models = models
+
+    def __call__(self, x):
+        ln_rho = 0.
+        for m in self.models:
+            ln_rho += m(x)
+        return ln_rho
+
+    def prior(self, x):
+        ln_prior = 0.
+        for m in self.models:
+            ln_prior += m(x)
+        return ln_prior
+
+
+class DiskModel(snt.Module):
+    def __init__(self, rho_0, h_z, h_R, x0):
+        super(DiskModel, self).__init__()
+        self.ln_rho0 = tf.Variable(
+            np.log(rho_0),
+            name='ln_rho0',
+            dtype=tf.float32
+        )
+        self.ln_hz = tf.Variable(
+            np.log(h_z),
+            name='ln_hz',
+            dtype=tf.float32
+        )
+        self.ln_hR = tf.Variable(
+            np.log(h_R),
+            name='ln_hR',
+            dtype=tf.float32
+        )
+        self.x0 = tf.Variable(
+            np.reshape(x0, (1,3)),
+            name='x0',
+            dtype=tf.float32,
+            trainable=False
+        )
+
+    def __call__(self, x):
+        x,y,z = tf.split(x-self.x0, 3, axis=1)
+        R = tf.math.sqrt(x**2 + y**2)
+        inv_rho_z = tf.math.cosh(z/tf.math.exp(ln_hz))
+        inv_rho_R = tf.math.cosh(R/tf.math.exp(ln_hR))
+        return self.ln_rho0 - tf.math.log(inv_rho_z) - tf.mathm.log(inv_rho_R)
+
+    def prior(self):
+        return 0.
+
+
 class FourierSeriesND(snt.Module):
     def __init__(self, n_dim, max_order,
                  extent=1, k_slope=0,
@@ -125,6 +179,9 @@ class FourierSeriesND(snt.Module):
         self.k = tf.constant(k, name='k', dtype=tf.float32)
         self.k2 = tf.constant(k2, name='k2', dtype=tf.float32)
 
+        # Prior slope (gamma = 2*k_slope)
+        self.gamma = tf.constant(2*k_slope, name='gamma', dtype=tf.float32)
+
     def copy_modes(self, model):
         assert model._phase_form == self._phase_form
         assert self._k_ball and model._k_ball
@@ -203,13 +260,13 @@ class FourierSeriesND(snt.Module):
         res = tf.expand_dims(res, 1)
         return res
 
-    def prior(self, k_slope):
+    def prior(self):
         # Penalties on amplitudes
         if self._phase_form:
-            p = tf.reduce_sum(tf.math.pow(self.k2,0.5*k_slope) * self.a**2)
+            p = tf.reduce_sum(tf.math.pow(self.k2,0.5*self.gamma) * self.a**2)
         else:
             p = tf.reduce_sum(
-                tf.math.pow(self.k2,0.5*k_slope) * (self.a**2 + self.b**2)
+                tf.math.pow(self.k2,0.5*self.gamma) * (self.a**2 + self.b**2)
             )
         # No penalty on (0,0) term (the zero point)
         return p
@@ -543,7 +600,7 @@ def train(log_rho_fit, dataset,
 
     # Function that takes one gradient-descent step
     @tf.function
-    def grad_step(A_obs, x_star, prior_weight, gamma):
+    def grad_step(A_obs, x_star, prior_weight):
         print('Tracing <grad_step()> ...')
 
         # Calculate distance to each star
@@ -556,8 +613,7 @@ def train(log_rho_fit, dataset,
             loss, log_chi2, prior, A_fit, diagnostics = loss_fn(
                 A_obs, x_star, ds_dt, log_rho_fit,
                 batch_size=batch_size,
-                prior_weight=prior_weight,
-                gamma=gamma
+                prior_weight=prior_weight
             )
 
         # Calculate and apply gradients of loss w.r.t. training variables
@@ -624,6 +680,7 @@ def train(log_rho_fit, dataset,
 
         prior_weight = get_prior_weight(i)
         gamma = get_gamma(i)
+        ln_rho_fit.gamma.assign(gamma)
         loss, A_fit, ln_chi2, prior, norm, n_eval = grad_step(
             A_obs, x_star, prior_weight, gamma
         )
@@ -874,8 +931,7 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
 
     def calc_loss(A_obs, x_star, ds_dt, log_rho_model,
                   batch_size=1024,
-                  prior_weight=tf.constant(1e-3),
-                  gamma=tf.constant(2.0)):
+                  prior_weight=tf.constant(1e-3)):
         def ode(t, A, dx_dt, ds_dt):
             r"""
             t = fractional distance along ray
@@ -894,7 +950,7 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
         )
         A_model = tf.squeeze(res.states)
         log_chi2 = tf.math.log(tf.reduce_mean((A_obs - A_model)**2))
-        prior = log_rho_model.prior(gamma)
+        prior = log_rho_model.prior()
         loss = log_chi2 + prior_weight * prior
         return loss, log_chi2, prior, A_model, res.diagnostics
 
