@@ -397,6 +397,39 @@ def plot_power(model, gamma=None, title=None):
     return fig
 
 
+def plot_A_residual_hist(log_rho, x_star, A_obs, A_err):
+    A_pred = calc_A(log_rho, x_star, rtol=1e-5, atol=1e-5)
+    dA = A_pred - A_obs
+    chi = dA / A_err
+
+    fig,(ax_d,ax_chi) = plt.subplots(1,2, figsize=(6,3), layout='constrained')
+
+    d_max = 1.3 * np.percentile(np.abs(dA), 99.9)
+    ax_d.hist(dA, bins=100, range=(-d_max,d_max), log=True)
+    ax_d.set_xlabel(r'$\Delta A \ \left(\mathrm{pred - obs}\right)$')
+
+    chi_max = 1.3 * np.percentile(np.abs(chi), 99.9)
+    _,bins,_ = ax_chi.hist(chi, bins=100, range=(-chi_max,chi_max), log=True)
+    ax_chi.set_xlabel(r'$\Delta A/\sigma_A \ \left(\mathrm{pred - obs}\right)$')
+
+    ylim = ax_chi.get_ylim()
+
+    x = np.linspace(bins[0], bins[-1], 1000)
+    dx = bins[1] - bins[0]
+    p_x = np.exp(-0.5*x**2) / np.sqrt(2*np.pi) * dx * len(x_star)
+    ax_chi.plot(x, p_x, alpha=0.3, label=r'$\mathrm{ideal}$')
+    ax_chi.legend(loc='upper right')
+
+    ax_chi.set_ylim(ylim)
+
+    for ax in (ax_d,ax_chi):
+        ax.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+        ax.grid(True, which='major', alpha=0.2)
+        ax.grid(True, which='minor', alpha=0.05)
+
+    return fig
+
+
 def plot_lnrho_A(img, x_star, A_star, extent,
                  star_extent=None,
                  title='',
@@ -566,9 +599,7 @@ def train(log_rho_fit, dataset,
 
     # Function that takes one gradient-descent step
     #@tf.function
-    def grad_step(A_obs, x_star):
-        print('Tracing <grad_step()> ...')
-
+    def grad_step(A_obs, A_err, x_star):
         # Calculate distance to each star
         #tf.print('Calculating ds_dt')
         ds_dt = tf.norm(x_star, axis=1, keepdims=True, name='ds_dt')
@@ -577,7 +608,8 @@ def train(log_rho_fit, dataset,
         #tf.print('loss_fn')
         with tf.GradientTape() as g:
             loss, log_chi2, prior, A_fit, diagnostics = loss_fn(
-                A_obs, x_star, ds_dt, log_rho_fit,
+                A_obs, A_err, x_star,
+                ds_dt, log_rho_fit,
                 batch_size=batch_size,
                 prior_weight=prior_weight
             )
@@ -601,10 +633,12 @@ def train(log_rho_fit, dataset,
 
     # Adapt training step for distribution strategy
     @tf.function
-    def distributed_grad_step(A_obs, x_star):
+    def distributed_grad_step(A_obs, A_err, x_star):
+        print('Tracing <distributed_grad_step()> ...')
+
         per_replica_results = strategy.run(
             grad_step,
-            args=(A_obs,x_star)
+            args=(A_obs, A_err, x_star)
         )
         return strategy.reduce(
             tf.distribute.ReduceOp.MEAN,
@@ -662,7 +696,7 @@ def train(log_rho_fit, dataset,
         initial=int(step.numpy()),
         total=n_steps
     )
-    for i,(A_obs,x_star) in step_iter:
+    for i,(A_obs,A_err,x_star) in step_iter:
         if i >= n_steps:
             break
 
@@ -673,7 +707,7 @@ def train(log_rho_fit, dataset,
 
         # Take a single gradient step
         loss, ln_chi2, prior, norm, n_eval = distributed_grad_step(
-            A_obs, x_star
+            A_obs, A_err, x_star
         )
 
         history['loss'].append(float(loss.numpy()))
@@ -691,7 +725,8 @@ def train(log_rho_fit, dataset,
             'norm': float(norm.numpy()),
             'n_eval': int(n_eval.numpy()),
             'gamma': float(gamma.numpy()),
-            'weight': float(prior_weight.numpy())
+            'weight': float(prior_weight.numpy()),
+            'zp': float(log_rho_fit.zp.numpy())
         }
         if physical_devices:
             mem_info = tf.config.experimental.get_memory_info(device_name)
@@ -796,7 +831,7 @@ def calc_image(log_rho, n_dim, extent, z=[0.], batch_size=1024):
     return img, [xlim, ylim]
 
 
-def calc_A(log_rho, x_star, batch_size=1024):
+def calc_A(log_rho, x_star, batch_size=1024, rtol=1e-8, atol=1e-7):
     n_stars = x_star.shape[0]
     A = np.empty(n_stars, dtype='f4')
 
@@ -806,7 +841,7 @@ def calc_A(log_rho, x_star, batch_size=1024):
         n = x.shape[0]
         ode_fn = get_ray_ode(log_rho, x)
         solver = tfp.math.ode.DormandPrince(
-            rtol=1e-8, atol=1e-7, name='ray_integrator'
+            rtol=rtol, atol=atol, name='ray_integrator'
         )
         res = solver.solve(
             ode_fn,
@@ -944,7 +979,7 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
         rtol=rtol, atol=atol, name='ray_integrator'
     )
 
-    def calc_loss(A_obs, x_star, ds_dt, log_rho_model,
+    def calc_loss(A_obs, A_err, x_star, ds_dt, log_rho_model,
                   batch_size=1024,
                   prior_weight=tf.constant(1e-3)):
         def ode(t, A, dx_dt, ds_dt):
@@ -964,10 +999,11 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
             constants={'dx_dt':x_star, 'ds_dt':ds_dt}
         )
         A_model = tf.squeeze(res.states)
-        log_chi2 = tf.math.log(tf.reduce_mean((A_obs - A_model)**2))
+        #log_chi2 = tf.math.log(tf.reduce_mean(((A_obs - A_model)/A_err)**2))
+        chi2 = tf.reduce_mean(((A_obs - A_model)/A_err)**2)
         prior = log_rho_model.prior()
-        loss = log_chi2 + prior_weight * prior
-        return loss, log_chi2, prior, A_model, res.diagnostics
+        loss = tf.math.log(chi2 + prior_weight * prior)
+        return loss, tf.math.log(chi2), prior, A_model, res.diagnostics
 
     return calc_loss
 
@@ -982,7 +1018,10 @@ def main():
         type=str,
         required=True,
         metavar='INPUT.(h5|fits)',
-        help='Astropy table with stellar positions (xyz) and extinctions (E).'
+        help=(
+            'Astropy table with stellar positions (xyz) '
+            'and extinctions (E, sigma_E).'
+        )
     )
     parser.add_argument(
         '-dir', '--directory',
@@ -1024,6 +1063,7 @@ def main():
     t = Table.read(data_fn)
 
     A_obs = t['E'].data.astype('f4')
+    A_err = t['sigma_E'].data.astype('f4')
     x_star = t['xyz'].data.astype('f4')
     n_stars = len(A_obs)
     print(f'Loaded {n_stars} sources.')
@@ -1033,9 +1073,10 @@ def main():
     rng = np.random.default_rng(3)
     rng.shuffle(idx)
     A_obs = A_obs[idx]
+    A_err = A_err[idx]
     x_star = x_star[idx]
 
-    dataset = tf.data.Dataset.from_tensor_slices((A_obs,x_star))
+    dataset = tf.data.Dataset.from_tensor_slices((A_obs,A_err,x_star))
 
     # Read options file
     with open(args.options, 'r') as f:
@@ -1134,6 +1175,18 @@ def main():
         ylim = [-box_extent[1], box_extent[1]]
         xlim_s = [-star_extent[0], star_extent[0]]
         ylim_s = [-star_extent[1], star_extent[1]]
+        # A residual histograms
+        n_hist_max = 1024*64
+        fig = plot_A_residual_hist(
+            log_rho_fit,
+            x_star[:n_hist_max],
+            A_obs[:n_hist_max],
+            A_err[:n_hist_max]
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'A_residuals_{train_round}')
+        )
+        plt.close(fig)
         # Sky projection
         for k,d in enumerate(np.arange(0.1, 1.01, 0.1)):
             fig,_ = plot_sky(
