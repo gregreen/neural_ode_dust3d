@@ -10,18 +10,7 @@ from matplotlib import ticker
 from matplotlib.colors import CenteredNorm
 
 import tensorflow as tf
-# Disable TensorFloat32, which is a reduced-precision float format
-tf.config.experimental.enable_tensor_float_32_execution(False)
-# Only allocate GPU memory as needed
-physical_devices = tf.config.list_physical_devices('GPU')
-try:
-    for device in physical_devices:
-        print(f'Setting memory growth on {device}.')
-        tf.config.experimental.set_memory_growth(device, True)
-except:
-    # Invalid device or cannot modify virtual devices once initialized.
-    print('Failed to set memory growth!')
-    pass
+
 import tensorflow.keras as keras
 import tensorflow_probability as tfp
 import tensorflow_addons as tfa
@@ -35,6 +24,35 @@ from argparse import ArgumentParser
 
 from astropy_healpix import HEALPix
 from skyplot_utils import plot_healpix_map
+
+#
+# Tensorflow setup
+#
+
+# Disable TensorFloat32, which is a reduced-precision float format
+tf.config.experimental.enable_tensor_float_32_execution(False)
+# Only allocate GPU memory as needed
+physical_devices = tf.config.list_physical_devices('GPU')
+try:
+    for device in physical_devices:
+        print(f'Setting memory growth on {device}.')
+        tf.config.experimental.set_memory_growth(device, True)
+except:
+    # Invalid device or cannot modify virtual devices once initialized.
+    print('Failed to set memory growth!')
+    pass
+
+if os.environ['VIRTUAL_GPUS']:
+    n_vgpus = int(os.environ['VIRTUAL_GPUS'])
+    mem_per_vgpu = 1024 * 5
+    for device in physical_devices:
+        tf.config.set_logical_device_configuration(
+            device,
+            [tf.config.LogicalDeviceConfiguration(memory_limit=mem_per_vgpu)
+             for n in range(n_vgpus)]
+        )
+    print('logical devices:')
+    print(tf.config.list_logical_devices('GPU'))
 
 
 class MultiComponentModel(snt.Module):
@@ -596,12 +614,12 @@ def train(log_rho_fit, dataset,
         global_clipnorm=100. # Guard-rails to prevent fitter from going haywire
     )
 
-    # Get the loss function, with a given integrator tolerance
-    loss_fn = get_loss_function(rtol=1e-7, atol=1e-5)
-
     # Function that takes one gradient-descent step
     #@tf.function
     def grad_step(A_obs, A_err, x_star):
+        # Get the loss function, with a given integrator tolerance
+        loss_fn = get_loss_function(rtol=1e-7, atol=1e-5)
+
         # Calculate distance to each star
         #tf.print('Calculating ds_dt')
         ds_dt = tf.norm(x_star, axis=1, keepdims=True, name='ds_dt')
@@ -612,7 +630,6 @@ def train(log_rho_fit, dataset,
             loss, log_chi2, prior, A_fit, diagnostics = loss_fn(
                 A_obs, A_err, x_star,
                 ds_dt, log_rho_fit,
-                batch_size=batch_size,
                 prior_weight=prior_weight
             )
 
@@ -981,7 +998,6 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
     )
 
     def calc_loss(A_obs, A_err, x_star, ds_dt, log_rho_model,
-                  batch_size=1024,
                   prior_weight=tf.constant(1e-3)):
         def ode(t, A, dx_dt, ds_dt):
             r"""
@@ -993,9 +1009,10 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
             dA_dt = ds_dt * tf.math.exp(log_rho_model(t*dx_dt))
             return dA_dt
 
+        initial_state = tf.expand_dims(tf.zeros_like(A_obs), 1)
         res = solver.solve(
             ode,
-            0, tf.zeros([batch_size,1]),
+            0, initial_state,
             tf.constant([1]),
             constants={'dx_dt':x_star, 'ds_dt':ds_dt}
         )
