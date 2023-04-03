@@ -15,10 +15,12 @@ tf.config.experimental.enable_tensor_float_32_execution(False)
 # Only allocate GPU memory as needed
 physical_devices = tf.config.list_physical_devices('GPU')
 try:
-    print(f'Setting memory growth on {physical_devices[0]}.')
-    tf.config.experimental.set_memory_growth(physical_devices[0], True)
+    for device in physical_devices:
+        print(f'Setting memory growth on {device}.')
+        tf.config.experimental.set_memory_growth(device, True)
 except:
     # Invalid device or cannot modify virtual devices once initialized.
+    print('Failed to set memory growth!')
     pass
 import tensorflow.keras as keras
 import tensorflow_probability as tfp
@@ -685,10 +687,9 @@ def train(log_rho_fit, dataset,
     physical_devices = tf.config.list_physical_devices('GPU')
     print('physical_devices:', physical_devices)
     if physical_devices:
-        device_name = physical_devices[0].name.removeprefix(
-            '/physical_device:'
-        )
-        tf.config.experimental.reset_memory_stats(device_name)
+        for device in physical_devices:
+            device_name = device.name.removeprefix('/physical_device:')
+            tf.config.experimental.reset_memory_stats(device_name)
 
     # Take gradient-descent steps on training batches
     step_iter = tqdm(
