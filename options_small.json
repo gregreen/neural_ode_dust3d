@@ -51,7 +51,33 @@
       "gamma1": 1.8,
       "log_w0": -3.0,
       "log_w1": -3.0,
-      "checkpoint_every": 0.2
+      "checkpoint_every": 0.1
+    },
+    {
+      "n_modes": [60, 60, 18],
+      "batch_size": 1024,
+      "n_epochs": 2,
+      "lr0": 1e-4,
+      "lr1": 1e-6,
+      "n_lr_drops": 6,
+      "gamma0": 1.8,
+      "gamma1": 1.8,
+      "log_w0": -3.0,
+      "log_w1": -3.0,
+      "checkpoint_every": 0.1
+    },
+    {
+      "n_modes": [80, 80, 24],
+      "batch_size": 512,
+      "n_epochs": 2,
+      "lr0": 1e-4,
+      "lr1": 1e-6,
+      "n_lr_drops": 6,
+      "gamma0": 1.8,
+      "gamma1": 1.8,
+      "log_w0": -3.0,
+      "log_w1": -3.0,
+      "checkpoint_every": 0.05
     }
   ]
 }
