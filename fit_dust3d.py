@@ -22,8 +22,6 @@ import os
 import json
 from argparse import ArgumentParser
 
-from astropy_healpix import HEALPix
-from skyplot_utils import plot_healpix_map
 
 #
 # Tensorflow setup
@@ -42,8 +40,8 @@ except:
     print('Failed to set memory growth!')
     pass
 
-if os.environ['VIRTUAL_GPUS']:
-    n_vgpus = int(os.environ['VIRTUAL_GPUS'])
+if os.getenv('VIRTUAL_GPUS'):
+    n_vgpus = int(os.getenv('VIRTUAL_GPUS'))
     mem_per_vgpu = 1024 * 5
     for device in physical_devices:
         tf.config.set_logical_device_configuration(
@@ -111,8 +109,10 @@ class DiskModel(snt.Module):
 
 class FourierSeriesND(snt.Module):
     def __init__(self, n_dim, max_order,
-                 extent=1, k_slope=0,
-                 mean=0, sigma=1,
+                 extent=1,
+                 power_law_slope=0.,
+                 mean=0., sigma=1.,
+                 scale_init_sigma=1.,
                  k_ball=True,
                  phase_form=False,
                  seed=None):
@@ -128,7 +128,9 @@ class FourierSeriesND(snt.Module):
             self.extent = [extent]*n_dim
         self._k_ball = k_ball
         self._phase_form = phase_form
-        self._initialize(k_slope, mean, sigma, seed=seed)
+        self.power_law_slope = power_law_slope
+        self._sigma = sigma
+        self._initialize(mean=mean, scale_init_sigma=scale_init_sigma, seed=seed)
 
     def _get_k_matrix(self, region, flatten=False):
         k_axes = []
@@ -151,7 +153,7 @@ class FourierSeriesND(snt.Module):
         return k
 
     @snt.once
-    def _initialize(self, k_slope, mean, sigma_tot, seed=None):
+    def _initialize(self, mean=0.0, scale_init_sigma=1.0, seed=None):
         rng = np.random.default_rng(seed)
 
         # Enumerate the regions of k-space that, combined with their mirror
@@ -177,31 +179,34 @@ class FourierSeriesND(snt.Module):
             k = k[:,idx]
             k2 = k2[idx]
 
-        # Calculate sigma of each mode (based on power spectrum)
-        sigma = k2**(-0.5*k_slope)
-        norm = sigma_tot / np.sqrt(1+np.sum(sigma**2))
+        # Calculate normalization of sigma_k, based on formula:
+        #   sigma^2 = sigma_1^2 \sum_k k^{powerlawslope}
+        k_power = k2**(0.5*self.power_law_slope)
+        sum_k_power = np.sum(k_power)
+        prior_norm = sum_k_power / self._sigma**2
+        sigma_k = self._sigma * np.sqrt(k_power / sum_k_power)
 
         # Generate coefficients and phases
         self.zp = tf.Variable(
-            mean + norm*rng.normal(),
+            mean + scale_init_sigma*self._sigma*rng.normal(),
             name='zp',
             dtype=tf.float32
         )
         self.a = tf.Variable(
-            norm*sigma*rng.normal(size=sigma.shape),
+            scale_init_sigma*sigma_k*rng.normal(size=sigma_k.shape),
             name='a',
             dtype=tf.float32
         )
         if self._phase_form:
             self.phi = tf.Variable(
-                rng.uniform(0, 2*np.pi, size=sigma.shape),
+                rng.uniform(0, 2*np.pi, size=sigma_k.shape),
                 name='phi',
                 dtype=tf.float32,
                 #constraint=lambda x: tf.math.mod(x, 2*np.pi)
             )
         else:
             self.b = tf.Variable(
-                norm*sigma*rng.normal(size=sigma.shape),
+                scale_init_sigma*sigma_k*rng.normal(size=sigma_k.shape),
                 name='b',
                 dtype=tf.float32
             )
@@ -210,13 +215,25 @@ class FourierSeriesND(snt.Module):
         self.k = tf.constant(k, name='k', dtype=tf.float32)
         self.k2 = tf.constant(k2, name='k2', dtype=tf.float32)
 
-        # Prior slope (gamma = 2*k_slope)
-        self.gamma = tf.Variable(
-            2*k_slope,
-            name='gamma',
+        # Power-law slope
+        self.power_law_slope = tf.Variable(
+            self.power_law_slope,
+            name='power_law_slope',
             dtype=tf.float32,
             trainable=False
         )
+        self.prior_norm = tf.Variable(
+            prior_norm,
+            name='prior_norm',
+            dtype=tf.float32,
+            trainable=False
+        )
+
+    def set_power_law_slope(self, power_law_slope):
+        self.power_law_slope.assign(power_law_slope)
+        k_power = self.k2**(0.5*self.power_law_slope)
+        sum_k_power = tf.math.reduce_sum(k_power)
+        self.prior_norm.assign(sum_k_power / self._sigma**2)
 
     def copy_modes(self, model):
         assert model._phase_form == self._phase_form
@@ -299,11 +316,15 @@ class FourierSeriesND(snt.Module):
     def prior(self):
         # Penalties on amplitudes
         if self._phase_form:
-            p = tf.reduce_sum(tf.math.pow(self.k2,0.5*self.gamma) * self.a**2)
+            p = tf.reduce_sum(
+                tf.math.pow(self.k2,-0.5*self.power_law_slope) * self.a**2
+            )
         else:
             p = tf.reduce_sum(
-                tf.math.pow(self.k2,0.5*self.gamma) * (self.a**2 + self.b**2)
+                tf.math.pow(self.k2,-0.5*self.power_law_slope)
+                * (self.a**2+self.b**2)
             )
+        p = p * self.prior_norm
         # No penalty on (0,0) term (the zero point)
         return p
 
@@ -564,7 +585,7 @@ def train(log_rho_fit, dataset,
           n_stars, batch_size, n_epochs,
           lr0=1e-3, lr1=1e-6, n_lr_drops=9,
           log_w0=-2, log_w1=-3,
-          gamma0=1.8, gamma1=1.8,
+          gamma0=-1.8, gamma1=-1.8,
           checkpoint_every=1,
           checkpoint_hours=1,
           max_checkpoints=16,
@@ -721,7 +742,7 @@ def train(log_rho_fit, dataset,
         # Update the weight and slope of the power-spectrum prior
         prior_weight.assign(get_prior_weight(i))
         gamma = get_gamma(i)
-        log_rho_fit.gamma.assign(gamma)
+        log_rho_fit.set_power_law_slope(gamma)
 
         # Take a single gradient step
         loss, ln_chi2, prior, norm, n_eval = distributed_grad_step(
@@ -877,6 +898,9 @@ def calc_A(log_rho, x_star, batch_size=1024, rtol=1e-8, atol=1e-7):
 
 def plot_sky(log_rho, dist, extent, A_reference=None,
              nside=64, batch_size=1024, title=''):
+    from astropy_healpix import HEALPix
+    from skyplot_utils import plot_healpix_map
+
     #@tf.function
     #def calc_A_batch(x):
     #    return calc_A(log_rho, x)
@@ -1130,8 +1154,9 @@ def main():
             log_rho_fit = FourierSeriesND(
                 n_dim, n_modes,
                 extent=box_extent,
-                k_slope=6,
-                sigma=0.1,
+                power_law_slope=-3.,
+                sigma=1.0,
+                scale_init_sigma=0.1,
                 phase_form=False,
                 seed=17*(train_round+1)
             )
