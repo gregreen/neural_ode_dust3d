@@ -585,7 +585,7 @@ def train(log_rho_fit, dataset,
           n_stars, batch_size, n_epochs,
           lr0=1e-3, lr1=1e-6, n_lr_drops=9,
           log_w0=-2, log_w1=-3,
-          gamma0=-1.8, gamma1=-1.8,
+          gamma0=3.6, gamma1=3.6,
           checkpoint_every=1,
           checkpoint_hours=1,
           max_checkpoints=16,
@@ -742,7 +742,7 @@ def train(log_rho_fit, dataset,
         # Update the weight and slope of the power-spectrum prior
         prior_weight.assign(get_prior_weight(i))
         gamma = get_gamma(i)
-        log_rho_fit.set_power_law_slope(gamma)
+        log_rho_fit.set_power_law_slope(-gamma)
 
         # Take a single gradient step
         loss, ln_chi2, prior, norm, n_eval = distributed_grad_step(
@@ -1154,7 +1154,7 @@ def main():
             log_rho_fit = FourierSeriesND(
                 n_dim, n_modes,
                 extent=box_extent,
-                power_law_slope=-3.,
+                power_law_slope=-opts.get('gamma0',3.5),
                 sigma=1.0,
                 scale_init_sigma=0.1,
                 phase_form=False,
