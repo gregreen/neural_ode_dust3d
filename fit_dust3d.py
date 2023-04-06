@@ -171,6 +171,7 @@ class FourierSeriesND(snt.Module):
             axis=1
         )
         k2 = np.sum(k**2, axis=0)
+        print(f'{k.size} modes.')
 
         # Limit modes to spherical region in k-space?
         if self._k_ball:
@@ -595,18 +596,29 @@ def train(log_rho_fit, dataset,
     # Get current distribution strategy (for working with multiple GPUs)
     strategy = tf.distribute.get_strategy()
 
+    # Get the number of devices (such as GPUs) to be used
+    n_devices = strategy.num_replicas_in_sync
+    global_batch_size = batch_size * n_devices
+
     # Break the dataset up into batches
     dataset = dataset.shuffle(
-                      buffer_size=64*batch_size
+                      buffer_size=64*global_batch_size
                   ).batch(
-                      batch_size, drop_remainder=True
+                      global_batch_size, drop_remainder=True
                   ).repeat(n_epochs)
     # Adapt dataset for given distribution strategy (across multiple GPUs)
     dataset = strategy.experimental_distribute_dataset(dataset)
 
     # Calculate the number of steps from the given
     # dataset size and requested # of epochs
-    n_steps = (n_stars // batch_size) * n_epochs
+    n_steps = (n_stars // global_batch_size) * n_epochs
+
+    print(  'Batching & step calculation:')
+    print(fr'  * devices: {n_devices}')
+    print(fr'  * stars: {n_stars}')
+    print(fr'  * epochs: {n_epochs}')
+    print(fr'  * local batch size: {batch_size}')
+    print(fr'  -> {n_steps} steps (= (n_stars//global_batch_size)*n_epochs)')
 
     # Smoothly increase the weight given to the prior during training
     def get_prior_weight(step):
@@ -697,7 +709,7 @@ def train(log_rho_fit, dataset,
 
     # Step counter (needed for checkpointing)
     step = tf.Variable(0, name='step')
-    checkpoint_steps = int(np.ceil(checkpoint_every * n_stars / batch_size))
+    checkpoint_steps = int(np.ceil(checkpoint_every*n_stars/global_batch_size))
 
     # Checkpointer
     checkpoint = tf.train.Checkpoint(log_rho=log_rho_fit, opt=opt, step=step)
