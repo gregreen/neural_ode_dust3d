@@ -171,7 +171,6 @@ class FourierSeriesND(snt.Module):
             axis=1
         )
         k2 = np.sum(k**2, axis=0)
-        print(f'{k.size} modes.')
 
         # Limit modes to spherical region in k-space?
         if self._k_ball:
@@ -179,6 +178,8 @@ class FourierSeriesND(snt.Module):
             idx = (k2 <= k_max**2 + 1e-5)
             k = k[:,idx]
             k2 = k2[idx]
+
+        print(f'{k.size} modes.')
 
         # Calculate normalization of sigma_k, based on formula:
         #   sigma^2 = sigma_1^2 \sum_k k^{powerlawslope}
@@ -1034,7 +1035,8 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
     )
 
     def calc_loss(A_obs, A_err, x_star, ds_dt, log_rho_model,
-                  prior_weight=tf.constant(1e-3)):
+                  prior_weight=tf.constant(1e-3),
+                  chi_outlier=tf.constant(10.)):
         def ode(t, A, dx_dt, ds_dt):
             r"""
             t = fractional distance along ray
@@ -1054,7 +1056,12 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
         )
         A_model = tf.squeeze(res.states)
         #log_chi2 = tf.math.log(tf.reduce_mean(((A_obs - A_model)/A_err)**2))
-        chi2 = tf.reduce_mean(((A_obs - A_model)/A_err)**2)
+        chi = (A_obs - A_model) / A_err
+        # Soften chi^2, so that when |chi| >> chi_outlier, the loss no longer
+        # grows quadratically with chi.
+        chi2 = tf.reduce_mean(
+            chi_outlier**2 * tf.math.asinh((chi/chi_outlier)**2)
+        )
         prior = log_rho_model.prior()
         loss = tf.math.log(chi2 + prior_weight * prior)
         return loss, tf.math.log(chi2), prior, A_model, res.diagnostics
