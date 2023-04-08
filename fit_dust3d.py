@@ -390,7 +390,9 @@ def get_ray_ode(log_rho_fn, x_star):
     return ode
 
 
-def plot_modes(model, gamma=0, title=None):
+def plot_modes(model, title_extra=None):
+    gamma = -float(model.power_law_slope.numpy())
+
     fig,ax = plt.subplots(
         1,1,
         subplot_kw=dict(aspect='equal'),
@@ -430,15 +432,74 @@ def plot_modes(model, gamma=0, title=None):
     ax.set_xlabel(r'$k_x$')
     ax.set_ylabel(r'$k_y$')
 
-    if title is None:
-        ax.set_title(r'Fourier space')
-    else:
-        ax.set_title(title)
+    title = 'Fourier space'
+    if title_extra is not None:
+        title += f' ({title_extra})'
+    ax.set_title(title)
 
     return fig
 
 
-def plot_power(model, gamma=None, title=None):
+def plot_modes_imshow(model, title_extra=None):
+    gamma = -float(model.power_law_slope.numpy())
+
+    fig,ax = plt.subplots(
+        1,1,
+        subplot_kw=dict(aspect='equal'),
+        figsize=(7.3,6),
+        dpi=100
+    )
+
+    k = model.k.numpy()
+    k2 = model.k2.numpy()
+    a = model.a.numpy()
+
+    # Convert k vectors into integer (x,y,z) indices
+    scale = np.array(model.extent)[:,None] / np.pi
+    k_x,k_y,k_z = np.round(k*scale).astype('i8')
+
+    # Select k_z == 0 modes
+    idx = (k_z == 0)
+
+    k_max = np.array(model.max_order)
+    x_idx = k_x[idx]+k_max[0]
+    y_idx = k_y[idx]+k_max[1]
+
+    # Create image of Fourier modes
+    img_shape = (2*k_max[0], 2*k_max[1])
+    img = np.full(img_shape, np.nan, dtype=a.dtype)
+
+    v = k2[idx]**(0.25*gamma) * a[idx]
+
+    img[x_idx,y_idx] = v
+    img[img_shape[0]-x_idx-1,img_shape[1]-y_idx-1] = v
+
+    x_max = k_max[0] + 0.5
+    y_max = k_max[1] + 0.5
+    im = ax.imshow(
+        img.T,
+        origin='lower',
+        extent=(-x_max,x_max,-y_max,y_max),
+        interpolation='nearest',
+        norm=CenteredNorm(),
+        cmap='coolwarm_r',
+        rasterized=True
+    )
+
+    fig.colorbar(im, label=fr'$k^{{{0.5*gamma}}} a_{{\vec{{k}}}}$')
+
+    ax.set_xlabel(r'$\pi k_x / L_x$')
+    ax.set_ylabel(r'$\pi k_y / L_y$')
+
+    title = 'Fourier space'
+    if title_extra is not None:
+        title += f' ({title_extra})'
+    ax.set_title(title)
+
+    return fig
+
+
+def plot_power(model, title_extra=None):
     k2 = model.k2.numpy()
     a2 = model.a.numpy()**2
     if not model._phase_form:
@@ -460,23 +521,26 @@ def plot_power(model, gamma=None, title=None):
 
     fig,ax = plt.subplots(1,1, figsize=(6,6), dpi=100)
 
-    if gamma is not None:
-        c = np.median(power_bin[:-1] * k_mid**(2*gamma))
-        ax.loglog(
-            k_mid, c*k_mid**(-2*gamma),
-            ls=':', alpha=0.5,
-            label=fr'$\propto k^{{-{2*gamma}}}$'
-        )
+    gamma = -float(model.power_law_slope.numpy())
+    c = np.median(power_bin[:-1] * k_mid**(gamma))
+    ax.loglog(
+        k_mid, c*k_mid**(-gamma),
+        ls=':', alpha=0.5,
+        label=fr'$P_k \propto k^{{-{gamma}}}$'
+    )
 
     ax.loglog(k_mid, power_bin[:-1], label='model')
 
     ax.set_xlabel(r'$k$')
-    ax.set_ylabel(r'$\left< \left| a \right|^2 \right>$')
+    coeff_label = r'\left| a \right|^2'
+    if not model._phase_form:
+        coeff_label += r' + \left| b \right|^2'
+    ax.set_ylabel(fr'$\left< {coeff_label} \right>$')
 
-    if title is None:
-        ax.set_title('power')
-    else:
-        ax.set_title(title)
+    title = 'Power spectrum'
+    if title_extra is not None:
+        title += f' ({title_extra})'
+    ax.set_title(title)
 
     ax.legend()
 
@@ -1139,6 +1203,19 @@ def plot_dust_and_stars(
     ylim = [-box_extent[1], box_extent[1]]
     xlim_s = [-star_extent[0], star_extent[0]]
     ylim_s = [-star_extent[1], star_extent[1]]
+
+    # Power spectrum
+    fig = plot_power(log_rho, title_extra=title)
+    fig.savefig(
+        os.path.join(fig_dir, f'power_spectrum{fn_suffix}')
+    )
+    plt.close(fig)
+
+    fig = plot_modes_imshow(log_rho, title_extra=title)
+    fig.savefig(
+        os.path.join(fig_dir, f'fourier_modes{fn_suffix}')
+    )
+    plt.close(fig)
 
     # A residual histograms
     n_hist_max = 1024*64
