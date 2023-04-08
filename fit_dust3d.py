@@ -53,6 +53,51 @@ if os.getenv('VIRTUAL_GPUS'):
     print(tf.config.list_logical_devices('GPU'))
 
 
+def batch_apply_tf(f, batch_size, *args,
+                   function=False, progress=False, numpy=False):
+    """
+    Applies a tensorflow function f(*args), but internally batches the args,
+    and then concatenates the results. The internal batching is usually
+    meant to avoid running out of memory.
+
+    Inputs:
+      f (function): The function to apply.
+      batch_size (int): Batch size.
+      *args (array-like): The arguments to pass to `f`. Each argument will be
+             batched along its zeroeth axis.
+      function (Optional[bool]): If `True`, the function `f` will be
+                                 wrapped using tf.function. Defaults to
+                                 `False`.
+      progress (Optional[bool]): If `True`, a progress bar will be shown.
+                                 Defaults to `False`.
+      numpy (Optional[bool]): If `True`, outputs will be converted to numpy
+                              arrays.
+
+    Outputs:
+      res: Should be the same as the output of f(*args). The batching should
+           have no impact on the final result.
+    """
+    res = []
+    def f_batch(*x):
+        return f(*x)
+    if function:
+        f_batch = tf.function(f_batch)
+    iterator = range(0, len(args[0]), batch_size)
+    if progress:
+        iterator = tqdm(iterator)
+    for i in iterator:
+        batch = [a[i:i+batch_size] for a in args]
+        res_batch = f_batch(*batch)
+        if numpy:
+            res_batch = res_batch.numpy()
+        res.append(res_batch)
+    if numpy:
+        res = np.concatenate(res, axis=0)
+    else:
+        res = tf.concat(res, axis=0)
+    return res
+
+
 class MultiComponentModel(snt.Module):
     def __init__(self, *models):
         super(MultiComponentModel, self).__init__()
@@ -805,47 +850,55 @@ def train(log_rho_fit, dataset,
     return history
 
 
-def gen_mock_data(max_order, n_stars, n_dim,
-                  sigma_A=0, k_slope=4, extent=10,
+def gen_mock_data(n_modes, star_extent, box_extent, n_stars,
+                  mu_lnrho=-1.0, sigma_lnrho=1.0, gamma=3.6, sigma_A=0,
                   batch_size=1024, seed=None):
+    ## Calculate box extent
+    #box_extent = [(1+box_buffer)*w for w in star_extent]
+    n_dim = len(n_modes)
+
     # Generate log(rho) field
     log_rho = FourierSeriesND(
-        n_dim,
-        max_order,
-        extent=extent,
-        k_slope=k_slope,
+        n_dim, n_modes,
+        extent=box_extent,
+        power_law_slope=-gamma,
+        sigma=sigma_lnrho,
         seed=seed
     )
+    log_rho.zp.assign(mu_lnrho)
 
     # Draw stellar positions
     if seed is not None:
         seed = 2 * seed + 1 # Use different seed for locations of stars
-
     rng = np.random.default_rng(seed)
 
+    n_dim = len(star_extent)
     x_star = rng.uniform(-1, 1, size=(n_stars,n_dim)).astype('f4')
-    if hasattr(extent, '__len__'):
-        for k,w in enumerate(extent):
-            x_star[:,k] *= 0.8*w
-    else:
-        x_star *= 0.8*extent
+    for k,w in enumerate(star_extent):
+        x_star[:,k] *= w
 
     # Calculate stellar extinctions
-    A = calc_A(log_rho, x_star)
+    A = calc_A(log_rho, x_star, batch_size=batch_size, atol=1e-5, rtol=1e-5)
 
-    #A = np.empty(n_stars, dtype='f4')
+    # Add noise into the stellar extinctions.
+    # First, choose an uncertainty for each star:
+    df = 9.0
+    A_err = sigma_A/df * rng.chisquare(df,size=A.shape).astype('f4')
+    A_err = np.sqrt(A_err**2 + (0.05*sigma_A)**2)
+    # Draw Gaussian noise for each star
+    A_obs = A + A_err * rng.normal(size=A.shape).astype('f4')
 
-    #@tf.function
-    #def calc_A_batch(x):
-    #    return calc_A(log_rho, x)
-
-    #for i in tqdm(range(0,n_stars,batch_size)):
-    #    A[i:i+batch_size] = calc_A_batch(x_star[i:i+batch_size]).numpy()
-
-    # Add noise into the stellar extinctions
-    A_obs = A + sigma_A * rng.normal(size=A.shape).astype('f4')
-
-    return log_rho, x_star, A, A_obs
+    # Return a dictionary of results
+    res = dict(
+        log_rho=log_rho,
+        star_extent=star_extent,
+        box_extent=box_extent,
+        x_star=x_star,
+        A=A,
+        A_obs=A_obs,
+        A_err=A_err
+    )
+    return res
 
 
 def calc_image(log_rho, n_dim, extent, z=[0.], batch_size=1024):
@@ -1069,20 +1122,192 @@ def get_loss_function(rtol=1e-7, atol=1e-5):
     return calc_loss
 
 
+def plot_dust_and_stars(
+            log_rho, x_star, A_obs, A_err,
+            box_extent, star_extent,
+            log_rho_true=None,
+            ln_rho_img_true=None,
+            ln_rho_intz_img_true=None,
+            fig_dir='plots/', fn_suffix='',
+            title='model'
+        ):
+    n_dim = len(box_extent)
+
+    # Plotting settings
+    n_stars_plot = 1024*8
+    xlim = [-box_extent[0], box_extent[0]]
+    ylim = [-box_extent[1], box_extent[1]]
+    xlim_s = [-star_extent[0], star_extent[0]]
+    ylim_s = [-star_extent[1], star_extent[1]]
+
+    # A residual histograms
+    n_hist_max = 1024*64
+    fig = plot_A_residual_hist(
+        log_rho,
+        x_star[:n_hist_max],
+        A_obs[:n_hist_max],
+        A_err[:n_hist_max]
+    )
+    fig.savefig(
+        os.path.join(fig_dir, f'A_residuals{fn_suffix}')
+    )
+    plt.close(fig)
+
+    # rho
+    ln_rho_img,_ = calc_image(
+        log_rho,
+        n_dim,
+        (xlim,ylim),
+        z=[0.]
+    )
+    rho_img = np.exp(ln_rho_img)
+    fig = plot_lnrho_A(
+        rho_img, [], [],
+        (xlim,ylim), star_extent=(xlim_s,ylim_s),
+        exp_img=True,
+        title=title
+    )
+    fig.savefig(
+        os.path.join(fig_dir, f'rho{fn_suffix}')
+    )
+    plt.close(fig)
+
+    # \int \rho dz
+    z_slices = np.linspace(-star_extent[2], star_extent[2], 201)
+    ln_rho_intz_img,_ = calc_image(
+        log_rho,
+        n_dim,
+        (xlim,ylim),
+        z=z_slices
+    )
+    rho_intz_img = np.exp(ln_rho_intz_img)
+    fig = plot_lnrho_A(
+        rho_intz_img, [], [],
+        (xlim,ylim), star_extent=(xlim_s,ylim_s),
+        exp_img=True,
+        title=f'{title} (integrated in z)'
+    )
+    fig.savefig(
+        os.path.join(fig_dir, f'rho_intz{fn_suffix}')
+    )
+    plt.close(fig)
+
+    # Sky projection
+    for k,d in enumerate(np.arange(0.1, 1.01, 0.1)):
+        fig,_ = plot_sky(
+            log_rho,
+            d, # kpc
+            star_extent
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'A_sky_d{k:02d}{fn_suffix}')
+        )
+        plt.close(fig)
+
+    # rho and predicted stellar A
+    x_plot = x_star[:n_stars_plot]
+    A_est_plot = calc_A(log_rho, x_plot)
+    A_obs_plot = A_obs[:n_stars_plot]
+    fig = plot_lnrho_A(
+        rho_img, x_plot, A_est_plot,
+        (xlim,ylim), star_extent=(xlim_s,ylim_s),
+        exp_img=True,
+        title=title
+    )
+    fig.savefig(
+        os.path.join(fig_dir, f'rho_stars{fn_suffix}')
+    )
+    plt.close(fig)
+
+    # rho and predicted-observed stellar A
+    fig = plot_lnrho_A(
+        rho_img, x_plot, A_est_plot-A_obs_plot,
+        (xlim,ylim), star_extent=(xlim_s,ylim_s),
+        diff_stars=True, exp_img=True,
+        title=f'{title} - observed'
+    )
+    fig.savefig(
+        os.path.join(fig_dir, f'rho_dstars{fn_suffix}')
+    )
+    plt.close(fig)
+
+    if log_rho_true is not None:
+        # rho and predicted-true stellar A
+        A_true_plot = calc_A(log_rho_true, x_plot)
+        fig = plot_lnrho_A(
+            rho_img, x_plot, A_est_plot-A_true_plot,
+            (xlim,ylim), star_extent=(xlim_s,ylim_s),
+            diff_stars=True, exp_img=True,
+            title=f'{title} - true'
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'rho_dstars_true{fn_suffix}')
+        )
+        plt.close(fig)
+
+        # rho
+        if ln_rho_img_true is None:
+            ln_rho_img_true,_ = calc_image(
+                log_rho_true,
+                n_dim,
+                (xlim,ylim),
+                z=[0.]
+            )
+        drho_img = rho_img - np.exp(ln_rho_img_true)
+        fig = plot_lnrho_A(
+            drho_img, [], [],
+            (xlim,ylim), star_extent=(xlim_s,ylim_s),
+            diff_img=True, exp_img=True,
+            title=f'{title} - true'
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'drho_true{fn_suffix}')
+        )
+        plt.close(fig)
+
+        # \int \rho dz
+        if ln_rho_intz_img_true is None:
+            ln_rho_intz_img_true,_ = calc_image(
+                log_rho_true,
+                n_dim,
+                (xlim,ylim),
+                z=z_slices
+            )
+        drho_intz_img = rho_intz_img - np.exp(ln_rho_intz_img_true)
+        fig = plot_lnrho_A(
+            drho_intz_img, [], [],
+            (xlim,ylim), star_extent=(xlim_s,ylim_s),
+            diff_img=True, exp_img=True,
+            title=f'{title} - true (integrated in z)'
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'drho_intz_true{fn_suffix}')
+        )
+        plt.close(fig)
+
+    return ln_rho_img, ln_rho_intz_img
+
+
 def main():
     parser = ArgumentParser(
         add_help=True,
         description='Fit 3D dust map in Fourier space.'
     )
-    parser.add_argument(
+    input_parser = parser.add_mutually_exclusive_group(required=True)
+    input_parser.add_argument(
         '-i', '--input',
         type=str,
-        required=True,
         metavar='INPUT.(h5|fits)',
         help=(
             'Astropy table with stellar positions (xyz) '
             'and extinctions (E, sigma_E).'
         )
+    )
+    input_parser.add_argument(
+        '--mock',
+        type=int,
+        metavar='SEED',
+        help='Generate mock data using given (int) seed.'
     )
     parser.add_argument(
         '-dir', '--directory',
@@ -1117,27 +1342,7 @@ def main():
 
     tf.random.set_seed(1)
 
-    # Load input data
-    data_fn = args.input
-    print(f'Loading {data_fn} ...')
-    from astropy.table import Table
-    t = Table.read(data_fn)
-
-    A_obs = t['E'].data.astype('f4')
-    A_err = t['sigma_E'].data.astype('f4')
-    x_star = t['xyz'].data.astype('f4')
-    n_stars = len(A_obs)
-    print(f'Loaded {n_stars} sources.')
-
-    # Shuffle stars
-    idx = np.arange(n_stars)
-    rng = np.random.default_rng(3)
-    rng.shuffle(idx)
-    A_obs = A_obs[idx]
-    A_err = A_err[idx]
-    x_star = x_star[idx]
-
-    dataset = tf.data.Dataset.from_tensor_slices((A_obs,A_err,x_star))
+    #
 
     # Read options file
     with open(args.options, 'r') as f:
@@ -1148,7 +1353,70 @@ def main():
     box_extent = extent.pop('box')
     n_dim = len(star_extent)
 
-    options = options['training_rounds']
+    # Plotting settings
+    n_stars_plot = 1024*8
+    xlim = [-box_extent[0], box_extent[0]]
+    ylim = [-box_extent[1], box_extent[1]]
+    xlim_s = [-star_extent[0], star_extent[0]]
+    ylim_s = [-star_extent[1], star_extent[1]]
+
+    # Check if mock data requested
+    if args.mock is not None:
+        print(f'Generating mock data with seed {args.mock} ...')
+        mock_options = options.pop('mock')
+        mock_modes = mock_options.pop('n_modes')
+        n_stars = mock_options.pop('n_stars')
+        sigma_A_mock = mock_options.get('sigma_A', 0.05)
+
+        res = gen_mock_data(
+            mock_modes, star_extent, box_extent, n_stars,
+            mu_lnrho=mock_options.get('mu_lnrho',-1.0),
+            sigma_lnrho=mock_options.get('sigma_lnrho',1.0),
+            gamma=mock_options.get('gamma', 3.6),
+            sigma_A=sigma_A_mock,
+            seed=args.mock
+        )
+
+        A_obs = res['A_obs']
+        A_err = res['A_err']
+        x_star = res['x_star']
+        log_rho_true = res['log_rho']
+        A_true = res['A']
+
+        print('Plotting mock data ...')
+        ln_rho_img_true, ln_rho_intz_img_true = plot_dust_and_stars(
+            log_rho_true, x_star, A_obs, A_err,
+            box_extent, star_extent,
+            fig_dir=fig_dir, fn_suffix='_mock',
+            title='true'
+        )
+    else:
+        # Load input data
+        data_fn = args.input
+        print(f'Loading {data_fn} ...')
+
+        from astropy.table import Table
+        t = Table.read(data_fn)
+
+        A_obs = t['E'].data.astype('f4')
+        A_err = t['sigma_E'].data.astype('f4')
+        x_star = t['xyz'].data.astype('f4')
+        n_stars = len(A_obs)
+        print(f'Loaded {n_stars} sources.')
+
+        # Shuffle stars
+        idx = np.arange(n_stars)
+        rng = np.random.default_rng(3)
+        rng.shuffle(idx)
+        A_obs = A_obs[idx]
+        A_err = A_err[idx]
+        x_star = x_star[idx]
+
+        log_rho_true = None
+        ln_rho_img_true = None
+        ln_rho_intz_img_true = None
+
+    dataset = tf.data.Dataset.from_tensor_slices((A_obs,A_err,x_star))
 
     # Define distribution strategy (for working with multiple GPUs)
     strategy = {
@@ -1159,6 +1427,7 @@ def main():
     print(f'Using {args.strategy} distribution strategy.')
 
     log_rho_old = None
+    options = options['training_rounds']
 
     for train_round,opts in enumerate(options):
         n_modes = opts.pop('n_modes')
@@ -1174,7 +1443,7 @@ def main():
                 n_dim, n_modes,
                 extent=box_extent,
                 power_law_slope=-opts.get('gamma0',3.5),
-                sigma=1.0,
+                sigma=opts.pop('sigma',1.0),
                 scale_init_sigma=0.1,
                 phase_form=False,
                 seed=17*(train_round+1)
@@ -1210,118 +1479,22 @@ def main():
                 **opts
             )
 
-            ## Load saved model
-            #checkpoint = tf.train.Checkpoint(log_rho=log_rho_fit)
-            #chkpt_manager = tf.train.CheckpointManager(
-            #    checkpoint,
-            #    directory=checkpoint_dir,
-            #    checkpoint_name='log_rho',
-            #    max_to_keep=999999
-            #)
-            #latest = chkpt_manager.latest_checkpoint
-            #print(f'Checkpoint: {latest}')
-            #if latest is not None:
-            #    print(f'Restoring from checkpoint {latest} ...')
-            #    checkpoint.restore(latest).assert_existing_objects_matched(
-            #                               ).expect_partial()
-
         # Plot results
         print('Plotting results ...')
-        # Loss history
+
         fig = plot_loss(history)
         fig.savefig(os.path.join(fig_dir, f'loss_history_{train_round}'))
         plt.close(fig)
-        
-        n_stars_plot = 1024*8
-        xlim = [-box_extent[0], box_extent[0]]
-        ylim = [-box_extent[1], box_extent[1]]
-        xlim_s = [-star_extent[0], star_extent[0]]
-        ylim_s = [-star_extent[1], star_extent[1]]
-        # A residual histograms
-        n_hist_max = 1024*64
-        fig = plot_A_residual_hist(
-            log_rho_fit,
-            x_star[:n_hist_max],
-            A_obs[:n_hist_max],
-            A_err[:n_hist_max]
-        )
-        fig.savefig(
-            os.path.join(fig_dir, f'A_residuals_{train_round}')
-        )
-        plt.close(fig)
-        # Sky projection
-        for k,d in enumerate(np.arange(0.1, 1.01, 0.1)):
-            fig,_ = plot_sky(
-                log_rho_fit,
-                d, # kpc
-                star_extent
-            )
-            fig.savefig(
-                os.path.join(fig_dir, f'A_sky_fit_d{k:02d}_{train_round}')
-            )
-            plt.close(fig)
-        # \int \rho dz
-        z_slices = np.linspace(-star_extent[2], star_extent[2], 201)
-        ln_rho_img,_ = calc_image(
-            log_rho_fit,
-            n_dim,
-            (xlim,ylim),
-            z=z_slices
-        )
-        rho_img = np.exp(ln_rho_img)
-        fig = plot_lnrho_A(
-            rho_img, [], [],
-            (xlim,ylim), star_extent=(xlim_s,ylim_s),
-            exp_img=True,
-            title='predicted (integrated in z)'
-        )
-        fig.savefig(
-            os.path.join(fig_dir, f'rho_fit_intz_{train_round}')
-        )
-        plt.close(fig)
-        # rho
-        ln_rho_img,_ = calc_image(
-            log_rho_fit,
-            n_dim,
-            (xlim,ylim),
-            z=[0.]
-        )
-        rho_img = np.exp(ln_rho_img)
-        fig = plot_lnrho_A(
-            rho_img, [], [],
-            (xlim,ylim), star_extent=(xlim_s,ylim_s),
-            exp_img=True,
+
+        plot_dust_and_stars(
+            log_rho_fit, x_star, A_obs, A_err,
+            box_extent, star_extent,
+            log_rho_true=log_rho_true,
+            ln_rho_img_true=ln_rho_img_true,
+            ln_rho_intz_img_true=ln_rho_intz_img_true,
+            fig_dir=fig_dir, fn_suffix=f'_{train_round}',
             title='predicted'
         )
-        fig.savefig(
-            os.path.join(fig_dir, f'rho_fit_{train_round}')
-        )
-        plt.close(fig)
-        # rho and predicted stellar A
-        x_plot = x_star[:n_stars_plot]
-        A_est_plot = calc_A(log_rho_fit, x_plot)
-        A_obs_plot = A_obs[:n_stars_plot]
-        fig = plot_lnrho_A(
-            rho_img, x_plot, A_est_plot,
-            (xlim,ylim), star_extent=(xlim_s,ylim_s),
-            exp_img=True,
-            title='predicted'
-        )
-        fig.savefig(
-            os.path.join(fig_dir, f'rho_fit_stars_{train_round}')
-        )
-        plt.close(fig)
-        # rho and predicted - observed stellar A
-        fig = plot_lnrho_A(
-            rho_img, x_plot, A_est_plot-A_obs_plot,
-            (xlim,ylim), star_extent=(xlim_s,ylim_s),
-            diff_stars=True, exp_img=True,
-            title='predicted - observed'
-        )
-        fig.savefig(
-            os.path.join(fig_dir, f'rho_fit_dstars_{train_round}')
-        )
-        plt.close(fig)
 
     return 0
 
