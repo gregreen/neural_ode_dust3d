@@ -1560,7 +1560,7 @@ def main():
 
             # Copy in modes of lower-resolution model, if available
             if train_round > 0:
-                log_rho_fit.copy_modes(log_rho_old)
+                log_rho_fit.copy_modes(log_rho_old, transition_width=4)
             log_rho_old = log_rho_fit
 
             # Ensure that checkpoint directory exists
