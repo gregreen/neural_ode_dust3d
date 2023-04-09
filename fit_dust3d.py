@@ -235,7 +235,7 @@ class FourierSeriesND(snt.Module):
         sum_k_power = tf.math.reduce_sum(k_power)
         self.prior_norm.assign(sum_k_power / self._sigma**2)
 
-    def copy_modes(self, model):
+    def copy_modes(self, model, transition_width=None):
         assert model._phase_form == self._phase_form
         assert self._k_ball and model._k_ball
 
@@ -258,6 +258,36 @@ class FourierSeriesND(snt.Module):
             atol=1e-8, rtol=1e-8
         )
 
+        # Determine how much to weight self and model amplitudes
+        if transition_width is None:
+            # Sharp transition between model and self
+            w_model = np.ones(n_model, dtype='f4')
+            w_self = np.zeros(n, dtype='f4')
+            w_self[n_model:] = 1.
+        else:
+            if self._phase_form:
+                # If in phase form, must first convert to (a,b) representation
+                # before applying transition region weighting, and then
+                # covert back afterwards.
+                raise NotImplementedError(
+                    '<transition_width> not implemented when phase_form==True'
+                )
+
+            # Smoothly transition over a width of Delta k = <transition_width>
+            k1 = np.sqrt(np.max(k2_model))
+            k0 = np.sqrt(np.max(k2_model)) - transition_width
+
+            w_model = np.ones(n_model, dtype='f4')
+            w = (k1-np.sqrt(k2_model[idx_model])) / (k1-k0)
+            w = np.clip(w, 0., 1.)
+            idx = (
+                (k2_model[idx_model] >= k0**2)
+            )
+            w_model[idx] = w[idx]
+
+            w_self = np.ones(n, dtype='f4')
+            w_self[:n_model] = 1. - w_model
+
         # Copy over the amplitudes and phases
         k = k[:,idx_self]
         self.k = tf.constant(k, dtype=tf.float32, name='k')
@@ -268,8 +298,8 @@ class FourierSeriesND(snt.Module):
         self.zp = tf.Variable(model.zp.numpy(), dtype=tf.float32, name='zp')
 
         a = self.a.numpy()
-        a = a[idx_self]
-        a[:n_model] = model.a.numpy()[idx_model[:n]]
+        a = w_self * a[idx_self]
+        a[:n_model] += w_model * model.a.numpy()[idx_model[:n]]
         self.a = tf.Variable(a, dtype=tf.float32, name='a')
 
         if self._phase_form:
@@ -279,8 +309,8 @@ class FourierSeriesND(snt.Module):
             self.phi = tf.Variable(phi, dtype=tf.float32, name='phi')
         else:
             b = self.b.numpy()
-            b = b[idx_self]
-            b[:n_model] = model.b.numpy()[idx_model[:n]]
+            b = w_self * b[idx_self]
+            b[:n_model] += w_model * model.b.numpy()[idx_model[:n]]
             self.b = tf.Variable(b, dtype=tf.float32, name='b')
 
 
