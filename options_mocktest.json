@@ -1,0 +1,68 @@
+{
+  "extent": {
+    "stars": [1.0, 1.0, 0.3],
+    "box": [1.5, 1.5, 0.45]
+  },
+  "mock": {
+    "n_modes": [40, 40, 12],
+    "n_stars": 1048576,
+    "mu_lnrho": -1.0,
+    "sigma_lnrho": 1.5,
+    "gamma": 3.5
+  },
+  "training_rounds": [
+    {
+      "n_modes": [10, 10, 3],
+      "batch_size": 8192,
+      "n_epochs": 10,
+      "sigma": 1.5,
+      "gamma0": 3.5,
+      "gamma1": 3.5,
+      "log_w0": -6.0,
+      "log_w1": -6.0,
+      "checkpoint_every": 0.5
+    },
+    {
+      "n_modes": [20, 20, 6],
+      "batch_size": 8192,
+      "n_epochs": 8,
+      "lr0": 5e-4,
+      "lr1": 1e-5,
+      "n_lr_drops": 6,
+      "sigma": 1.5,
+      "gamma0": 3.5,
+      "gamma1": 3.5,
+      "log_w0": -6.0,
+      "log_w1": -6.0,
+      "checkpoint_every": 0.2
+    },
+    {
+      "n_modes": [30, 30, 9],
+      "batch_size": 4096,
+      "n_epochs": 4,
+      "lr0": 5e-4,
+      "lr1": 1e-5,
+      "n_lr_drops": 6,
+      "sigma": 1.5,
+      "gamma0": 3.5,
+      "gamma1": 3.5,
+      "log_w0": -6.0,
+      "log_w1": -6.0,
+      "checkpoint_every": 0.1
+    },
+    {
+      "n_modes": [40, 40, 12],
+      "batch_size": 2048,
+      "n_epochs": 4,
+      "lr0": 1e-4,
+      "lr1": 1e-6,
+      "n_lr_drops": 6,
+      "sigma": 1.5,
+      "gamma0": 3.5,
+      "gamma1": 3.5,
+      "log_w0": -6.0,
+      "log_w1": -6.0,
+      "checkpoint_every": 0.1
+    }
+  ]
+}
