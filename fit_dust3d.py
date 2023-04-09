@@ -493,7 +493,7 @@ def plot_modes_imshow(model, title_extra=None):
     y_idx = k_y[idx]+k_max[1]
 
     # Create image of Fourier modes
-    img_shape = (2*k_max[0], 2*k_max[1])
+    img_shape = (2*k_max[0]+1, 2*k_max[1]+1)
     img = np.full(img_shape, np.nan, dtype=a.dtype)
 
     v = k2[idx]**(0.25*gamma) * a[idx]
