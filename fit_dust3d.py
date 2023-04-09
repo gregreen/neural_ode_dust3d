@@ -224,7 +224,7 @@ class FourierSeriesND(snt.Module):
             k = k[:,idx]
             k2 = k2[idx]
 
-        print(f'{k.size} modes.')
+        print(f'{k2.size} modes.')
 
         # Calculate normalization of sigma_k, based on formula:
         #   sigma^2 = sigma_1^2 \sum_k k^{powerlawslope}
@@ -321,16 +321,13 @@ class FourierSeriesND(snt.Module):
                 )
 
             # Smoothly transition over a width of Delta k = <transition_width>
+            scale = np.exp(np.mean(np.log(np.pi/np.array(self.extent))))
+            dk = scale * transition_width
             k1 = np.sqrt(np.max(k2_model))
-            k0 = np.sqrt(np.max(k2_model)) - transition_width
+            k0 = np.sqrt(np.max(k2_model)) - dk
 
-            w_model = np.ones(n_model, dtype='f4')
-            w = (k1-np.sqrt(k2_model[idx_model])) / (k1-k0)
-            w = np.clip(w, 0., 1.)
-            idx = (
-                (k2_model[idx_model] >= k0**2)
-            )
-            w_model[idx] = w[idx]
+            w_model = (k1-np.sqrt(k2_model[idx_model])) / (k1-k0)
+            w_model = np.clip(w_model, 0., 1.)
 
             w_self = np.ones(n, dtype='f4')
             w_self[:n_model] = 1. - w_model
