@@ -277,6 +277,16 @@ class FourierSeriesND(snt.Module):
             trainable=False
         )
 
+    def _recalc_sigma_k(self):
+        k_power = self.k2**(0.5*self.power_law_slope)
+        sum_k_power = tf.math.reduce_sum(k_power)
+        sigma_k_new = self._sigma * np.sqrt(k_power / sum_k_power)
+        self.sigma_k = tf.constant(
+            sigma_k_new,
+            name='sigma_k',
+            dtype=tf.float32
+        )
+
     def set_power_law_slope(self, power_law_slope):
         self.power_law_slope.assign(power_law_slope)
 
@@ -295,11 +305,12 @@ class FourierSeriesND(snt.Module):
         assert model._phase_form == self._phase_form
         assert self._k_ball and model._k_ball
 
-        # Not handling conversion of coefficient scalings, for now
-        assert (
-            np.abs(self.power_law_slope.numpy()-model.power_law_slope.numpy())
-            < 1e-5
-        )
+        # Remove scaling from coefficients
+        a_self = self.a.numpy() * self.sigma_k.numpy()
+        b_self = self.b.numpy() * self.sigma_k.numpy()
+
+        a_model = model.a.numpy() * model.sigma_k.numpy()
+        b_model = model.b.numpy() * model.sigma_k.numpy()
 
         # Sort modes by k^2 in order to match
         k_model = model.k.numpy()
@@ -354,11 +365,13 @@ class FourierSeriesND(snt.Module):
         k2 = k2[idx_self]
         self.k2 = tf.constant(k2, dtype=tf.float32, name='k2')
 
+        self._recalc_sigma_k()
+
         self.zp = tf.Variable(model.zp.numpy(), dtype=tf.float32, name='zp')
 
-        a = self.a.numpy()
-        a = w_self * a[idx_self]
-        a[:n_model] += w_model * model.a.numpy()[idx_model[:n]]
+        a = w_self * a_self[idx_self]
+        a[:n_model] += w_model * a_model[idx_model[:n]]
+        a /= self.sigma_k.numpy()
         self.a = tf.Variable(a, dtype=tf.float32, name='a')
 
         if self._phase_form:
@@ -367,9 +380,9 @@ class FourierSeriesND(snt.Module):
             phi[:n_model] = model.phi.numpy()[idx_model[:n]]
             self.phi = tf.Variable(phi, dtype=tf.float32, name='phi')
         else:
-            b = self.b.numpy()
-            b = w_self * b[idx_self]
-            b[:n_model] += w_model * model.b.numpy()[idx_model[:n]]
+            b = w_self * b_self[idx_self]
+            b[:n_model] += w_model * b_model[idx_model[:n]]
+            b /= self.sigma_k.numpy()
             self.b = tf.Variable(b, dtype=tf.float32, name='b')
 
 
@@ -562,9 +575,10 @@ def plot_power(model, title_extra=None):
         a2 *= 0.5
 
     n_bins = max(10, int(np.sqrt(k2.size)/4))
-    ln_k2_min = np.log(np.min(k2))
-    ln_k2_max = np.log(np.max(k2))
-    k2_bins = np.exp(np.linspace(ln_k2_min, ln_k2_max, n_bins))
+    #ln_k2_min = np.log(np.min(k2))
+    #ln_k2_max = np.log(np.max(k2))
+    #k2_bins = np.exp(np.linspace(ln_k2_min, ln_k2_max, n_bins))
+    k2_bins = np.linspace(np.min(k2), np.max(k2), n_bins)
 
     bin_idx = np.digitize(k2, k2_bins)
     power_bin = np.zeros(k2_bins.size)
@@ -574,11 +588,12 @@ def plot_power(model, title_extra=None):
         power_bin[j] = np.mean(a2[idx])
 
     k_mid = (k2_bins[1:]*k2_bins[:-1])**(1/4)
+    #k_mid = 0.5 * (k2_bins[1:] + k2_bins[:-1])
 
     fig,ax = plt.subplots(1,1, figsize=(6,6), dpi=100)
 
     gamma = -float(model.power_law_slope.numpy())
-    ax.loglog(k_mid, power_bin[:-1], label='model')
+    ax.semilogy(k_mid, power_bin[:-1], label='model')
     ax.axhline(
         1.,
         ls=':', alpha=0.5,
@@ -590,7 +605,7 @@ def plot_power(model, title_extra=None):
     prefix = ''
     if not model._phase_form:
         coeff_label += r' + \left| b \right|^2'
-        prefix = r'\frac{1}{2}'
+        prefix = r'\frac{1}{2}\,'
     ax.set_ylabel(fr'${prefix} k^{{ {gamma} }} \left< {coeff_label} \right>$')
 
     title = 'Power spectrum'
