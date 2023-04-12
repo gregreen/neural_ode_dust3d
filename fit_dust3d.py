@@ -822,9 +822,13 @@ def train(log_rho_fit, dataset,
         decay_rate=(lr1/lr0)**(1/n_lr_drops),
         staircase=True
     )
-    opt = keras.optimizers.SGD(
+    #opt = keras.optimizers.SGD(
+    #    learning_rate=lr_schedule,
+    #    momentum=0.5,
+    #    global_clipnorm=100. # Guard-rails to prevent fitter from going haywire
+    #)
+    opt = keras.optimizers.Adam(
         learning_rate=lr_schedule,
-        momentum=0.5,
         global_clipnorm=100. # Guard-rails to prevent fitter from going haywire
     )
 
