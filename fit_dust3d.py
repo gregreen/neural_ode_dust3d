@@ -240,7 +240,7 @@ class FourierSeriesND(snt.Module):
             dtype=tf.float32
         )
         self.a = tf.Variable(
-            scale_init_sigma*sigma_k*rng.normal(size=sigma_k.shape),
+            scale_init_sigma*rng.normal(size=sigma_k.shape),
             name='a',
             dtype=tf.float32
         )
@@ -253,7 +253,7 @@ class FourierSeriesND(snt.Module):
             )
         else:
             self.b = tf.Variable(
-                scale_init_sigma*sigma_k*rng.normal(size=sigma_k.shape),
+                scale_init_sigma*rng.normal(size=sigma_k.shape),
                 name='b',
                 dtype=tf.float32
             )
@@ -261,6 +261,7 @@ class FourierSeriesND(snt.Module):
         # Save constants
         self.k = tf.constant(k, name='k', dtype=tf.float32)
         self.k2 = tf.constant(k2, name='k2', dtype=tf.float32)
+        self.sigma_k = tf.constant(sigma_k, name='sigma_k', dtype=tf.float32)
 
         # Power-law slope
         self.power_law_slope = tf.Variable(
@@ -276,15 +277,40 @@ class FourierSeriesND(snt.Module):
             trainable=False
         )
 
-    def set_power_law_slope(self, power_law_slope):
-        self.power_law_slope.assign(power_law_slope)
+    def _recalc_sigma_k(self):
         k_power = self.k2**(0.5*self.power_law_slope)
         sum_k_power = tf.math.reduce_sum(k_power)
+        sigma_k_new = self._sigma * np.sqrt(k_power / sum_k_power)
+        self.sigma_k = tf.constant(
+            sigma_k_new,
+            name='sigma_k',
+            dtype=tf.float32
+        )
+
+    def set_power_law_slope(self, power_law_slope):
+        self.power_law_slope.assign(power_law_slope)
+
+        # Update sigma_k, and rescale Fourier coefficients
+        k_power = self.k2**(0.5*self.power_law_slope)
+        sum_k_power = tf.math.reduce_sum(k_power)
+        sigma_k_new = self._sigma * np.sqrt(k_power / sum_k_power)
+        self.a.assign(self.a*self.sigma_k/sigma_k_new)
+        self.b.assign(self.b*self.sigma_k/sigma_k_new)
+        self.sigma_k = tf.constant(sigma_k_new, name='sigma_k', dtype=tf.float32)
+
+        # Update prior normalization
         self.prior_norm.assign(sum_k_power / self._sigma**2)
 
     def copy_modes(self, model, transition_width=None):
         assert model._phase_form == self._phase_form
         assert self._k_ball and model._k_ball
+
+        # Remove scaling from coefficients
+        a_self = self.a.numpy() * self.sigma_k.numpy()
+        b_self = self.b.numpy() * self.sigma_k.numpy()
+
+        a_model = model.a.numpy() * model.sigma_k.numpy()
+        b_model = model.b.numpy() * model.sigma_k.numpy()
 
         # Sort modes by k^2 in order to match
         k_model = model.k.numpy()
@@ -339,11 +365,13 @@ class FourierSeriesND(snt.Module):
         k2 = k2[idx_self]
         self.k2 = tf.constant(k2, dtype=tf.float32, name='k2')
 
+        self._recalc_sigma_k()
+
         self.zp = tf.Variable(model.zp.numpy(), dtype=tf.float32, name='zp')
 
-        a = self.a.numpy()
-        a = w_self * a[idx_self]
-        a[:n_model] += w_model * model.a.numpy()[idx_model[:n]]
+        a = w_self * a_self[idx_self]
+        a[:n_model] += w_model * a_model[idx_model[:n]]
+        a /= self.sigma_k.numpy()
         self.a = tf.Variable(a, dtype=tf.float32, name='a')
 
         if self._phase_form:
@@ -352,9 +380,9 @@ class FourierSeriesND(snt.Module):
             phi[:n_model] = model.phi.numpy()[idx_model[:n]]
             self.phi = tf.Variable(phi, dtype=tf.float32, name='phi')
         else:
-            b = self.b.numpy()
-            b = w_self * b[idx_self]
-            b[:n_model] += w_model * model.b.numpy()[idx_model[:n]]
+            b = w_self * b_self[idx_self]
+            b[:n_model] += w_model * b_model[idx_model[:n]]
+            b /= self.sigma_k.numpy()
             self.b = tf.Variable(b, dtype=tf.float32, name='b')
 
 
@@ -375,30 +403,31 @@ class FourierSeriesND(snt.Module):
         #   j := point,
         #   i := dimension,
         #   k := mode
-        # y_{j} = a_{k} cos(z_{jk}) ( + b_{k} sin(z_{jk}) )
+        # y_{j} = [a_{k} cos(z_{jk}) ( + b_{k} sin(z_{jk}) )] sigma_{k}
         z = tf.tensordot(x, self.k, axes=[[1],[0]])
         if self._phase_form:
             z = z + self.phi
 
-        res = self.zp + tf.tensordot(self.a, tf.math.cos(z), axes=[[0],[1]])
+        res = self.zp + tf.tensordot(
+            self.a * self.sigma_k, tf.math.cos(z),
+            axes=[[0],[1]]
+        )
         if not self._phase_form:
-            res = res + tf.tensordot(self.b, tf.math.sin(z), axes=[[0],[1]])
+            res = res + tf.tensordot(
+                self.b * self.sigma_k, tf.math.sin(z),
+                axes=[[0],[1]]
+            )
 
         res = tf.expand_dims(res, 1)
         return res
 
     def prior(self):
         # Penalties on amplitudes
+        # (unit normal, because amplitudes are rescaled by sigma_k)
         if self._phase_form:
-            p = tf.reduce_sum(
-                tf.math.pow(self.k2,-0.5*self.power_law_slope) * self.a**2
-            )
+            p = tf.reduce_sum(self.a**2)
         else:
-            p = tf.reduce_sum(
-                tf.math.pow(self.k2,-0.5*self.power_law_slope)
-                * (self.a**2+self.b**2)
-            )
-        p = p * self.prior_norm
+            p = tf.reduce_sum(self.a**2 + self.b**2)
         # No penalty on (0,0) term (the zero point)
         return p
 
@@ -432,7 +461,7 @@ def plot_modes(model, title_extra=None):
     a = model.a.numpy()
 
     n = a.size
-    v = k2**(0.5*gamma) * a
+    v = a
     vmax = np.max(np.abs(v))
 
     idx = np.argmin(np.pi*np.array(model.max_order)/np.array(model.extent))
@@ -467,7 +496,7 @@ def plot_modes(model, title_extra=None):
     return fig
 
 
-def plot_modes_imshow(model, title_extra=None):
+def plot_modes_imshow(model, title_extra=None, clip_order=None):
     gamma = -float(model.power_law_slope.numpy())
 
     fig,ax = plt.subplots(
@@ -496,13 +525,25 @@ def plot_modes_imshow(model, title_extra=None):
     img_shape = (2*k_max[0]+1, 2*k_max[1]+1)
     img = np.full(img_shape, np.nan, dtype=a.dtype)
 
-    v = k2[idx]**(0.25*gamma) * a[idx]
-
+    v = a[idx]
     img[x_idx,y_idx] = v
     img[img_shape[0]-x_idx-1,img_shape[1]-y_idx-1] = v
 
     x_max = k_max[0] + 0.5
     y_max = k_max[1] + 0.5
+
+    # Clip image?
+    if clip_order is not None:
+        x0 = max(k_max[0] - clip_order[0], 0)
+        y0 = max(k_max[1] - clip_order[1], 0)
+        x1 = img.shape[0] - x0
+        y1 = img.shape[1] - y0
+
+        img = img[x0:x1,y0:y1]
+
+        x_max -= x0
+        y_max -= y0
+
     im = ax.imshow(
         img.T,
         origin='lower',
@@ -531,11 +572,13 @@ def plot_power(model, title_extra=None):
     a2 = model.a.numpy()**2
     if not model._phase_form:
         a2 += model.b.numpy()**2
+        a2 *= 0.5
 
     n_bins = max(10, int(np.sqrt(k2.size)/4))
-    ln_k2_min = np.log(np.min(k2))
-    ln_k2_max = np.log(np.max(k2))
-    k2_bins = np.exp(np.linspace(ln_k2_min, ln_k2_max, n_bins))
+    #ln_k2_min = np.log(np.min(k2))
+    #ln_k2_max = np.log(np.max(k2))
+    #k2_bins = np.exp(np.linspace(ln_k2_min, ln_k2_max, n_bins))
+    k2_bins = np.linspace(np.min(k2), np.max(k2), n_bins)
 
     bin_idx = np.digitize(k2, k2_bins)
     power_bin = np.zeros(k2_bins.size)
@@ -545,24 +588,25 @@ def plot_power(model, title_extra=None):
         power_bin[j] = np.mean(a2[idx])
 
     k_mid = (k2_bins[1:]*k2_bins[:-1])**(1/4)
+    #k_mid = 0.5 * (k2_bins[1:] + k2_bins[:-1])
 
     fig,ax = plt.subplots(1,1, figsize=(6,6), dpi=100)
 
     gamma = -float(model.power_law_slope.numpy())
-    c = np.median(power_bin[:-1] * k_mid**(gamma))
-    ax.loglog(
-        k_mid, c*k_mid**(-gamma),
+    ax.semilogy(k_mid, power_bin[:-1], label='model')
+    ax.axhline(
+        1.,
         ls=':', alpha=0.5,
         label=fr'$P_k \propto k^{{-{gamma}}}$'
     )
 
-    ax.loglog(k_mid, power_bin[:-1], label='model')
-
     ax.set_xlabel(r'$k$')
     coeff_label = r'\left| a \right|^2'
+    prefix = ''
     if not model._phase_form:
         coeff_label += r' + \left| b \right|^2'
-    ax.set_ylabel(fr'$\left< {coeff_label} \right>$')
+        prefix = r'\frac{1}{2}\,'
+    ax.set_ylabel(fr'${prefix} k^{{ {gamma} }} \left< {coeff_label} \right>$')
 
     title = 'Power spectrum'
     if title_extra is not None:
@@ -779,9 +823,13 @@ def train(log_rho_fit, dataset,
         decay_rate=(lr1/lr0)**(1/n_lr_drops),
         staircase=True
     )
-    opt = keras.optimizers.SGD(
+    #opt = keras.optimizers.SGD(
+    #    learning_rate=lr_schedule,
+    #    momentum=0.5,
+    #    global_clipnorm=100. # Guard-rails to prevent fitter from going haywire
+    #)
+    opt = keras.optimizers.Adam(
         learning_rate=lr_schedule,
-        momentum=0.5,
         global_clipnorm=100. # Guard-rails to prevent fitter from going haywire
     )
 
@@ -1335,6 +1383,17 @@ def plot_dust_and_stars(
         os.path.join(fig_dir, f'fourier_modes{fn_suffix}')
     )
     plt.close(fig)
+
+    if log_rho_true is not None:
+        fig = plot_modes_imshow(
+            log_rho_true,
+            title_extra='mock clipped',
+            clip_order=np.array(log_rho.max_order)
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'fourier_modes_mockclipped{fn_suffix}')
+        )
+        plt.close(fig)
 
     # A residual histograms
     n_hist_max = 1024*64
