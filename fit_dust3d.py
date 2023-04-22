@@ -240,7 +240,7 @@ class FourierSeriesND(snt.Module):
             dtype=tf.float32
         )
         self.a = tf.Variable(
-            scale_init_sigma*sigma_k*rng.normal(size=sigma_k.shape),
+            scale_init_sigma*rng.normal(size=sigma_k.shape),
             name='a',
             dtype=tf.float32
         )
@@ -253,7 +253,7 @@ class FourierSeriesND(snt.Module):
             )
         else:
             self.b = tf.Variable(
-                scale_init_sigma*sigma_k*rng.normal(size=sigma_k.shape),
+                scale_init_sigma*rng.normal(size=sigma_k.shape),
                 name='b',
                 dtype=tf.float32
             )
@@ -261,6 +261,7 @@ class FourierSeriesND(snt.Module):
         # Save constants
         self.k = tf.constant(k, name='k', dtype=tf.float32)
         self.k2 = tf.constant(k2, name='k2', dtype=tf.float32)
+        self.sigma_k = tf.constant(sigma_k, name='sigma_k', dtype=tf.float32)
 
         # Power-law slope
         self.power_law_slope = tf.Variable(
@@ -276,15 +277,40 @@ class FourierSeriesND(snt.Module):
             trainable=False
         )
 
-    def set_power_law_slope(self, power_law_slope):
-        self.power_law_slope.assign(power_law_slope)
+    def _recalc_sigma_k(self):
         k_power = self.k2**(0.5*self.power_law_slope)
         sum_k_power = tf.math.reduce_sum(k_power)
+        sigma_k_new = self._sigma * np.sqrt(k_power / sum_k_power)
+        self.sigma_k = tf.constant(
+            sigma_k_new,
+            name='sigma_k',
+            dtype=tf.float32
+        )
+
+    def set_power_law_slope(self, power_law_slope):
+        self.power_law_slope.assign(power_law_slope)
+
+        # Update sigma_k, and rescale Fourier coefficients
+        k_power = self.k2**(0.5*self.power_law_slope)
+        sum_k_power = tf.math.reduce_sum(k_power)
+        sigma_k_new = self._sigma * np.sqrt(k_power / sum_k_power)
+        self.a.assign(self.a*self.sigma_k/sigma_k_new)
+        self.b.assign(self.b*self.sigma_k/sigma_k_new)
+        self.sigma_k = tf.constant(sigma_k_new, name='sigma_k', dtype=tf.float32)
+
+        # Update prior normalization
         self.prior_norm.assign(sum_k_power / self._sigma**2)
 
     def copy_modes(self, model, transition_width=None):
         assert model._phase_form == self._phase_form
         assert self._k_ball and model._k_ball
+
+        # Remove scaling from coefficients
+        a_self = self.a.numpy() * self.sigma_k.numpy()
+        b_self = self.b.numpy() * self.sigma_k.numpy()
+
+        a_model = model.a.numpy() * model.sigma_k.numpy()
+        b_model = model.b.numpy() * model.sigma_k.numpy()
 
         # Sort modes by k^2 in order to match
         k_model = model.k.numpy()
@@ -339,11 +365,13 @@ class FourierSeriesND(snt.Module):
         k2 = k2[idx_self]
         self.k2 = tf.constant(k2, dtype=tf.float32, name='k2')
 
+        self._recalc_sigma_k()
+
         self.zp = tf.Variable(model.zp.numpy(), dtype=tf.float32, name='zp')
 
-        a = self.a.numpy()
-        a = w_self * a[idx_self]
-        a[:n_model] += w_model * model.a.numpy()[idx_model[:n]]
+        a = w_self * a_self[idx_self]
+        a[:n_model] += w_model * a_model[idx_model[:n]]
+        a /= self.sigma_k.numpy()
         self.a = tf.Variable(a, dtype=tf.float32, name='a')
 
         if self._phase_form:
@@ -352,9 +380,9 @@ class FourierSeriesND(snt.Module):
             phi[:n_model] = model.phi.numpy()[idx_model[:n]]
             self.phi = tf.Variable(phi, dtype=tf.float32, name='phi')
         else:
-            b = self.b.numpy()
-            b = w_self * b[idx_self]
-            b[:n_model] += w_model * model.b.numpy()[idx_model[:n]]
+            b = w_self * b_self[idx_self]
+            b[:n_model] += w_model * b_model[idx_model[:n]]
+            b /= self.sigma_k.numpy()
             self.b = tf.Variable(b, dtype=tf.float32, name='b')
 
 
@@ -375,30 +403,31 @@ class FourierSeriesND(snt.Module):
         #   j := point,
         #   i := dimension,
         #   k := mode
-        # y_{j} = a_{k} cos(z_{jk}) ( + b_{k} sin(z_{jk}) )
+        # y_{j} = [a_{k} cos(z_{jk}) ( + b_{k} sin(z_{jk}) )] sigma_{k}
         z = tf.tensordot(x, self.k, axes=[[1],[0]])
         if self._phase_form:
             z = z + self.phi
 
-        res = self.zp + tf.tensordot(self.a, tf.math.cos(z), axes=[[0],[1]])
+        res = self.zp + tf.tensordot(
+            self.a * self.sigma_k, tf.math.cos(z),
+            axes=[[0],[1]]
+        )
         if not self._phase_form:
-            res = res + tf.tensordot(self.b, tf.math.sin(z), axes=[[0],[1]])
+            res = res + tf.tensordot(
+                self.b * self.sigma_k, tf.math.sin(z),
+                axes=[[0],[1]]
+            )
 
         res = tf.expand_dims(res, 1)
         return res
 
     def prior(self):
         # Penalties on amplitudes
+        # (unit normal, because amplitudes are rescaled by sigma_k)
         if self._phase_form:
-            p = tf.reduce_sum(
-                tf.math.pow(self.k2,-0.5*self.power_law_slope) * self.a**2
-            )
+            p = tf.reduce_sum(self.a**2)
         else:
-            p = tf.reduce_sum(
-                tf.math.pow(self.k2,-0.5*self.power_law_slope)
-                * (self.a**2+self.b**2)
-            )
-        p = p * self.prior_norm
+            p = tf.reduce_sum(self.a**2 + self.b**2)
         # No penalty on (0,0) term (the zero point)
         return p
 
@@ -432,7 +461,7 @@ def plot_modes(model, title_extra=None):
     a = model.a.numpy()
 
     n = a.size
-    v = k2**(0.5*gamma) * a
+    v = a
     vmax = np.max(np.abs(v))
 
     idx = np.argmin(np.pi*np.array(model.max_order)/np.array(model.extent))
@@ -467,7 +496,7 @@ def plot_modes(model, title_extra=None):
     return fig
 
 
-def plot_modes_imshow(model, title_extra=None):
+def plot_modes_imshow(model, title_extra=None, clip_order=None):
     gamma = -float(model.power_law_slope.numpy())
 
     fig,ax = plt.subplots(
@@ -496,13 +525,25 @@ def plot_modes_imshow(model, title_extra=None):
     img_shape = (2*k_max[0]+1, 2*k_max[1]+1)
     img = np.full(img_shape, np.nan, dtype=a.dtype)
 
-    v = k2[idx]**(0.25*gamma) * a[idx]
-
+    v = a[idx]
     img[x_idx,y_idx] = v
     img[img_shape[0]-x_idx-1,img_shape[1]-y_idx-1] = v
 
     x_max = k_max[0] + 0.5
     y_max = k_max[1] + 0.5
+
+    # Clip image?
+    if clip_order is not None:
+        x0 = max(k_max[0] - clip_order[0], 0)
+        y0 = max(k_max[1] - clip_order[1], 0)
+        x1 = img.shape[0] - x0
+        y1 = img.shape[1] - y0
+
+        img = img[x0:x1,y0:y1]
+
+        x_max -= x0
+        y_max -= y0
+
     im = ax.imshow(
         img.T,
         origin='lower',
@@ -531,11 +572,13 @@ def plot_power(model, title_extra=None):
     a2 = model.a.numpy()**2
     if not model._phase_form:
         a2 += model.b.numpy()**2
+        a2 *= 0.5
 
     n_bins = max(10, int(np.sqrt(k2.size)/4))
-    ln_k2_min = np.log(np.min(k2))
-    ln_k2_max = np.log(np.max(k2))
-    k2_bins = np.exp(np.linspace(ln_k2_min, ln_k2_max, n_bins))
+    #ln_k2_min = np.log(np.min(k2))
+    #ln_k2_max = np.log(np.max(k2))
+    #k2_bins = np.exp(np.linspace(ln_k2_min, ln_k2_max, n_bins))
+    k2_bins = np.linspace(np.min(k2), np.max(k2), n_bins)
 
     bin_idx = np.digitize(k2, k2_bins)
     power_bin = np.zeros(k2_bins.size)
@@ -545,24 +588,25 @@ def plot_power(model, title_extra=None):
         power_bin[j] = np.mean(a2[idx])
 
     k_mid = (k2_bins[1:]*k2_bins[:-1])**(1/4)
+    #k_mid = 0.5 * (k2_bins[1:] + k2_bins[:-1])
 
     fig,ax = plt.subplots(1,1, figsize=(6,6), dpi=100)
 
     gamma = -float(model.power_law_slope.numpy())
-    c = np.median(power_bin[:-1] * k_mid**(gamma))
-    ax.loglog(
-        k_mid, c*k_mid**(-gamma),
+    ax.semilogy(k_mid, power_bin[:-1], label='model')
+    ax.axhline(
+        1.,
         ls=':', alpha=0.5,
         label=fr'$P_k \propto k^{{-{gamma}}}$'
     )
 
-    ax.loglog(k_mid, power_bin[:-1], label='model')
-
     ax.set_xlabel(r'$k$')
     coeff_label = r'\left| a \right|^2'
+    prefix = ''
     if not model._phase_form:
         coeff_label += r' + \left| b \right|^2'
-    ax.set_ylabel(fr'$\left< {coeff_label} \right>$')
+        prefix = r'\frac{1}{2}\,'
+    ax.set_ylabel(fr'${prefix} k^{{ {gamma} }} \left< {coeff_label} \right>$')
 
     title = 'Power spectrum'
     if title_extra is not None:
@@ -724,6 +768,10 @@ def train(log_rho_fit, dataset,
           lr0=1e-3, lr1=1e-6, n_lr_drops=9,
           log_w0=-2, log_w1=-3,
           gamma0=3.6, gamma1=3.6,
+          use_dist_err=False,
+          chi2_outlier=25.,
+          rtol=1e-7,
+          atol=1e-5,
           checkpoint_every=1,
           checkpoint_hours=1,
           max_checkpoints=16,
@@ -778,29 +826,44 @@ def train(log_rho_fit, dataset,
         decay_rate=(lr1/lr0)**(1/n_lr_drops),
         staircase=True
     )
-    opt = keras.optimizers.SGD(
+    #opt = keras.optimizers.SGD(
+    #    learning_rate=lr_schedule,
+    #    momentum=0.5,
+    #    global_clipnorm=100. # Guard-rails to prevent fitter from going haywire
+    #)
+    opt = keras.optimizers.Adam(
         learning_rate=lr_schedule,
-        momentum=0.5,
         global_clipnorm=100. # Guard-rails to prevent fitter from going haywire
     )
 
     # Function that takes one gradient-descent step
     #@tf.function
-    def grad_step(A_obs, A_err, x_star):
+    def grad_step(*args):
         # Get the loss function, with a given integrator tolerance
-        loss_fn = get_loss_function(rtol=1e-7, atol=1e-5)
+        loss_fn = get_loss_function(
+            rtol=rtol, atol=atol,
+            use_dist_err=use_dist_err,
+            chi2_outlier=tf.constant(chi2_outlier)
+        )
 
-        # Calculate distance to each star
-        #tf.print('Calculating ds_dt')
-        ds_dt = tf.norm(x_star, axis=1, keepdims=True, name='ds_dt')
+        if use_dist_err:
+            A_obs, A_err, d_err, x_star = args
+            # Integrate out to max dist of d_obs + n*d_err for each star
+            d_obs = tf.norm(x_star, axis=1, name='d_obs')
+            dx_ds = x_star / tf.expand_dims(d_obs, axis=1)
+            ds_dt = tf.expand_dims(d_obs+5*d_err, axis=1, name='ds_dt')
+            inputs = (A_obs, A_err, d_obs, d_err, dx_ds, ds_dt, log_rho_fit)
+        else:
+            A_obs, A_err, x_star = args
+            # Integrate out to distance of each star
+            ds_dt = tf.norm(x_star, axis=1, keepdims=True, name='ds_dt')
+            inputs = (A_obs, A_err, x_star, ds_dt, log_rho_fit)
 
         # Calculate loss
         #tf.print('loss_fn')
         with tf.GradientTape() as g:
-            loss, log_chi2, prior, A_fit, diagnostics = loss_fn(
-                A_obs, A_err, x_star,
-                ds_dt, log_rho_fit,
-                prior_weight=prior_weight
+            loss, likelihood, prior, diagnostics = loss_fn(
+                *inputs, prior_weight=prior_weight
             )
 
         # Calculate and apply gradients of loss w.r.t. training variables
@@ -818,16 +881,16 @@ def train(log_rho_fit, dataset,
         #tf.print('global norm:', norm)
         #tf.print('# of evaluations:', n_eval)
 
-        return loss, log_chi2, prior, norm, n_eval
+        return loss, likelihood, prior, norm, n_eval
 
     # Adapt training step for distribution strategy
     @tf.function
-    def distributed_grad_step(A_obs, A_err, x_star):
+    def distributed_grad_step(*args):
         print('Tracing <distributed_grad_step()> ...')
 
         per_replica_results = strategy.run(
             grad_step,
-            args=(A_obs, A_err, x_star)
+            args=args
         )
         return strategy.reduce(
             tf.distribute.ReduceOp.MEAN,
@@ -838,7 +901,7 @@ def train(log_rho_fit, dataset,
     # Keep track of history of loss, chi^2 and prior during training
     history = {
         'loss': [],
-        'ln_chi2': [],
+        'likelihood': [],
         'prior': [],
         'norm': [],
         'n_eval': []
@@ -884,7 +947,7 @@ def train(log_rho_fit, dataset,
         initial=int(step.numpy()),
         total=n_steps
     )
-    for i,(A_obs,A_err,x_star) in step_iter:
+    for i,data_batch in step_iter:
         if i >= n_steps:
             break
 
@@ -894,26 +957,25 @@ def train(log_rho_fit, dataset,
         log_rho_fit.set_power_law_slope(-gamma)
 
         # Take a single gradient step
-        loss, ln_chi2, prior, norm, n_eval = distributed_grad_step(
-            A_obs, A_err, x_star
+        loss, likelihood, prior, norm, n_eval = distributed_grad_step(
+            *data_batch
         )
 
         history['loss'].append(float(loss.numpy()))
-        history['ln_chi2'].append(float(ln_chi2.numpy()))
+        history['likelihood'].append(float(likelihood.numpy()))
         history['prior'].append(float(prior.numpy()))
         history['norm'].append(float(norm.numpy()))
         history['n_eval'].append(int(n_eval.numpy()))
 
         # Display diagnostics on progress bar
         progress_info = {
-            'ln(chi2)': float(ln_chi2.numpy()),
-            'prior': float(prior.numpy()),
             'loss': float(loss.numpy()),
+            'prior': float(prior.numpy()),
             #'lr': float(opt._decayed_lr(tf.float32)),
             'norm': float(norm.numpy()),
             'n_eval': int(n_eval.numpy()),
-            'gamma': float(gamma.numpy()),
-            'weight': float(prior_weight.numpy()),
+            #'gamma': float(gamma.numpy()),
+            #'weight': float(prior_weight.numpy()),
             'zp': float(log_rho_fit.zp.numpy())
         }
         if physical_devices:
@@ -942,7 +1004,8 @@ def train(log_rho_fit, dataset,
 
 
 def gen_mock_data(n_modes, star_extent, box_extent, n_stars,
-                  mu_lnrho=-1.0, sigma_lnrho=1.0, gamma=3.6, sigma_A=0,
+                  mu_lnrho=-1.0, sigma_lnrho=1.0, gamma=3.6,
+                  sigma_A=0, sigma_r=0,
                   batch_size=1024, seed=None):
     ## Calculate box extent
     #box_extent = [(1+box_buffer)*w for w in star_extent]
@@ -979,12 +1042,27 @@ def gen_mock_data(n_modes, star_extent, box_extent, n_stars,
     # Draw Gaussian noise for each star
     A_obs = A + A_err * rng.normal(size=A.shape).astype('f4')
 
+    # Add noise into the stellar distances.
+    # First, choose a fractional distance uncertainty for each star:
+    df = 9.0
+    d_err = sigma_r/df * rng.chisquare(df,size=A.shape).astype('f4')
+    d_err = np.sqrt(d_err**2 + (0.05*sigma_r)**2)
+    # Draw Gaussian noise for each star
+    dr = d_err * rng.normal(size=A.shape).astype('f4')
+    # Observed position of star
+    x_obs = x_star * (1+dr)[:,None]
+    # Scale fractional uncertainty to absolute uncertainty
+    d_star = np.linalg.norm(x_star, axis=1)
+    d_err *= d_star
+
     # Return a dictionary of results
     res = dict(
         log_rho=log_rho,
         star_extent=star_extent,
         box_extent=box_extent,
         x_star=x_star,
+        x_obs=x_obs,
+        d_err=d_err,
         A=A,
         A_obs=A_obs,
         A_err=A_err
@@ -1115,10 +1193,10 @@ def plot_loss(history):
     fig,(ax_u,ax_l) = plt.subplots(2,1, figsize=(6,6))
 
     ax_u.plot(history['loss'], label='loss')
-    ax_u.plot(history['ln_chi2'], alpha=0.5, label=r'$\ln \chi^2$')
+    ax_u.plot(history['likelihood'], alpha=0.5, label='likelihood')
 
     ax_u.plot([], [], alpha=0.5, label='prior') # dummy plot, for legend
-    ax_u.set_ylabel(r'$\mathrm{loss}$, $\ln \chi^2$')
+    ax_u.set_ylabel(r'$\mathrm{loss}$, $\mathrm{likelihood}$')
 
     ax2 = ax_u.twinx()
     for i in range(2):
@@ -1161,54 +1239,191 @@ def plot_loss(history):
     return fig
 
 
-def get_loss_function(rtol=1e-7, atol=1e-5):
+def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(25.),
+                      rtol=1e-7, atol=1e-5):
     """
     Returns a function that calculates the loss of
     a model of ln(rho), given a set of stellar observations.
 
     Inputs:
-      rtol (float): Relative tolerance of the integrator (default: 1e-7).
-      atol (float): Absolute tolerance of the integrator (default: 1e-5).
+      use_dist_err (Optional[bool]): Take distance uncertainties into account
+        (default: False).
+      chi2_outlier(Optional[float]): Suppress effect of chi-square values
+        beyond this value (default: 25).
+      rtol (Optional[float]): Relative tolerance of the integrator
+        (default: 1e-7).
+      atol (Optional[float]): Absolute tolerance of the integrator
+        (default: 1e-5).
 
     Returns:
       `calc_loss`, the loss function.
     """
     # ODE solver
     solver = tfp.math.ode.DormandPrince(
-        rtol=rtol, atol=atol, name='ray_integrator'
+        rtol=rtol, atol=atol, name='ray_integrator',
+        #max_num_steps=1000
     )
 
-    def calc_loss(A_obs, A_err, x_star, ds_dt, log_rho_model,
-                  prior_weight=tf.constant(1e-3),
-                  chi_outlier=tf.constant(10.)):
-        def ode(t, A, dx_dt, ds_dt):
-            r"""
-            t = fractional distance along ray
-            A = \int \exp(\ln \rho) ds = extinction
-            dx_dt = change in position per unit time (t) = position of star
-            ds_dt = path length per unit time (t) = distance to star
-            """
-            dA_dt = ds_dt * tf.math.exp(log_rho_model(t*dx_dt))
-            return dA_dt
+    if use_dist_err:
+        def calc_loss(A_obs, A_err, d_obs, d_err,
+                      dx_ds, ds_dt, log_rho_model,
+                      prior_weight=tf.constant(1e-3),
+                      lnL_outlier=tf.constant(-50.)):
+            def ode(t, AL, dx_ds, ds_dt, d_obs, d_err, A_obs, A_err):
+                r"""
+                Calculates d(A,L)/dt along the ray.
+                  t = fractional distance along ray
+                  AL = (A, L) = (extinction, likelihood) = ODE state
+                  dx_ds = unit vector pointing to star
+                  ds_dt = path length per unit time (t) = distance to star
+                """
+                #print('t =', t)
+                #print('AL =', AL)
+                #print('dx/ds =', dx_ds)
+                #print('ds/dt =', ds_dt)
+                #print('d_obs =', d_obs)
+                #print('d_err =', d_err)
+                #print('A_obs =', A_obs)
+                #print('A_err =', A_err)
 
-        initial_state = tf.expand_dims(tf.zeros_like(A_obs), 1)
-        res = solver.solve(
-            ode,
-            0, initial_state,
-            tf.constant([1]),
-            constants={'dx_dt':x_star, 'ds_dt':ds_dt}
-        )
-        A_model = tf.squeeze(res.states)
-        #log_chi2 = tf.math.log(tf.reduce_mean(((A_obs - A_model)/A_err)**2))
-        chi = (A_obs - A_model) / A_err
-        # Soften chi^2, so that when |chi| >> chi_outlier, the loss no longer
-        # grows quadratically with chi.
-        chi2 = tf.reduce_mean(
-            chi_outlier**2 * tf.math.asinh((chi/chi_outlier)**2)
-        )
-        prior = log_rho_model.prior()
-        loss = tf.math.log(chi2 + prior_weight * prior)
-        return loss, tf.math.log(chi2), prior, A_model, res.diagnostics
+                A_t,L_t = tf.split(AL, [1,1], axis=1)
+                A_t = tf.squeeze(A_t, axis=1)
+                #print('A(t) =', A_t)
+                L_t = tf.squeeze(L_t, axis=1)
+                #print('L(t) =', L_t)
+
+                # Current position and distance
+                d = t * ds_dt
+                x = dx_ds * d
+                #print('x =', x)
+                d = tf.squeeze(d, axis=1)
+                #print('d =', d)
+
+                # dA/ds = rho(x(s))
+                dA_ds = tf.math.exp(log_rho_model(x))
+                dA_ds = tf.squeeze(dA_ds, axis=1)
+                #print('dA/ds =', dA_ds)
+
+                # dL/ds = N(A|A_obs,A_err) * N(d|d_obs,d_err)
+                chi2 = (
+                    ((d_obs-d)/d_err)**2
+                  + ((A_obs-A_t)/A_err)**2
+                )
+                chi2 = (
+                    chi2_outlier * tf.math.asinh(chi2/chi2_outlier)
+                )
+                dL_ds = tf.math.exp(-0.5*chi2)
+
+                #dL_ds = tf.math.exp(-0.5 * (
+                #    ((d_obs-d)/d_err)**2
+                #  + ((A_obs-A_t)/A_err)**2
+                #))
+                #print('dL/ds =', dL_ds)
+                
+                # d(A,L)/dt = ds/dt * d(A,L)/ds
+                dAL_dt = ds_dt * tf.stack([dA_ds,dL_ds], axis=1)
+                #print('d(AL)/dt =', dAL_dt)
+
+                #if np.any(~np.isfinite(t.numpy())):
+                #    return None
+
+                return dAL_dt
+
+            # Initial state: (A,L) = (0,0)
+            AL0 = tf.zeros((A_obs.shape[0], 2))
+            #AL0 = tf.zeros_like(A_obs)
+            #AL0 = tf.stack([AL0,AL0], axis=1)
+            print('AL0 =', AL0)
+
+            # Solve ODE
+            res = solver.solve(
+                ode,
+                0, AL0,
+                tf.constant([1]),
+                constants={
+                    'dx_ds':dx_ds, 'ds_dt':ds_dt,
+                    'd_obs':d_obs, 'd_err':d_err,
+                    'A_obs':A_obs, 'A_err':A_err
+                }
+            )
+
+            # Extract (A,L) as distance -> infinity
+            AL_final = tf.squeeze(res.states, axis=0)
+            #print('AL(t=1) =', AL_final)
+            A_final,L_final = tf.split(AL_final, [1,1], axis=1)
+            A_final = tf.squeeze(A_final, axis=1)
+            L_final = tf.squeeze(L_final, axis=1)
+
+            # Require L >= 0 (numerical integration of strictly positive
+            # functions can yield slightly negative values).
+            L_final = tf.clip_by_value(L_final, 0, np.inf)
+            #print('A(t=1) =', A_final)
+            print('L(t=1) =', L_final)
+
+            # Calculate loss from L and prior
+            lnL = tf.math.log(L_final) - tf.math.log(A_err*d_err)
+            #idx = np.isnan(lnL.numpy())
+            #if np.any(idx):
+            #    print('NaN lnL!')
+            #    print('  lnL =', lnL.numpy()[idx])
+            #    print('  L_final =', L_final.numpy()[idx])
+            #    print('  A_err =', A_err.numpy()[idx])
+            #    print('  d_err =', d_err.numpy()[idx])
+            #n_above_min = np.count_nonzero(lnL.numpy()>lnL_outlier.numpy())
+
+            # Add in floor on L (using stable addition method, similar to
+            # tf.math.reduce_logsumexp)
+            lnL = tfp.math.log_add_exp(lnL, lnL_outlier)
+            #lnL0 = tf.minimum(lnL, lnL_outlier)
+            #lnL1 = tf.maximum(lnL, lnL_outlier)
+            #lnL = lnL1 + tf.math.log(1 + tf.math.exp(lnL0-lnL1))
+            #lnL = tf.clip_by_value(lnL, lnL_outlier, np.inf)
+            #if np.any(idx):
+            #    print('  clipped lnL =', lnL.numpy()[idx])
+            #print(f'{n_above_min} stars above minimum likelihood.')
+            print('ln(L) =', lnL)
+            #idx = ~np.isfinite(lnL.numpy())
+            #if np.any(idx):
+            #    print('Non-finite lnL!')
+            #    print('  lnL =', lnL.numpy()[idx])
+            likelihood = -2 * tf.reduce_mean(lnL)
+            print('likelihood =', likelihood)
+            prior = log_rho_model.prior()
+            loss = likelihood + prior_weight * prior
+
+            return loss, likelihood, prior, res.diagnostics
+    else:
+        def calc_loss(A_obs, A_err, x_star, ds_dt, log_rho_model,
+                      prior_weight=tf.constant(1e-3)):
+            def ode(t, A, dx_dt, ds_dt):
+                r"""
+                t = fractional distance along ray
+                A = \int \exp(\ln \rho) ds = extinction
+                dx_dt = change in position per unit time (t) = position of star
+                ds_dt = path length per unit time (t) = distance to star
+                """
+                # dA/dt = dA/ds * ds/dt = rho(x(s)) ds/dt
+                dA_dt = ds_dt * tf.math.exp(log_rho_model(t*dx_dt))
+                return dA_dt
+
+            initial_state = tf.expand_dims(tf.zeros_like(A_obs), 1)
+            res = solver.solve(
+                ode,
+                0, initial_state,
+                tf.constant([1]),
+                constants={'dx_dt':x_star, 'ds_dt':ds_dt}
+            )
+            A_model = tf.squeeze(res.states)
+            #log_chi2 = tf.math.log(tf.reduce_mean(((A_obs - A_model)/A_err)**2))
+            chi2 = ((A_obs - A_model) / A_err)**2
+            # Soften chi^2, so that when chi^2 >~ chi2_outlier, the loss no longer
+            # grows quadratically with chi.
+            chi2 = tf.reduce_mean(
+                chi2_outlier * tf.math.asinh(chi2/chi2_outlier)
+            )
+            prior = log_rho_model.prior()
+            loss = tf.math.log(chi2 + prior_weight * prior)
+            return loss, tf.math.log(chi2), prior, res.diagnostics
 
     return calc_loss
 
@@ -1243,6 +1458,17 @@ def plot_dust_and_stars(
         os.path.join(fig_dir, f'fourier_modes{fn_suffix}')
     )
     plt.close(fig)
+
+    if log_rho_true is not None:
+        fig = plot_modes_imshow(
+            log_rho_true,
+            title_extra='mock clipped',
+            clip_order=np.array(log_rho.max_order)
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f'fourier_modes_mockclipped{fn_suffix}')
+        )
+        plt.close(fig)
 
     # A residual histograms
     n_hist_max = 1024*64
@@ -1434,6 +1660,16 @@ def main():
         default='default',
         help='Which TF distribution strategy to use (for multiple GPUs)'
     )
+    parser.add_argument(
+        '--use-dist-err',
+        action='store_true',
+        help='Take distance uncertainties into account.'
+    )
+    parser.add_argument(
+        '--omit-plots',
+        action='store_true',
+        help='Do not plot results (for quick tests).'
+    )
     args = parser.parse_args()
 
     # Ensure that various required directories exist
@@ -1446,8 +1682,6 @@ def main():
 
     tf.random.set_seed(1)
 
-    #
-
     # Read options file
     with open(args.options, 'r') as f:
         options = json.load(f)
@@ -1456,6 +1690,15 @@ def main():
     star_extent = extent.pop('stars')
     box_extent = extent.pop('box')
     n_dim = len(star_extent)
+
+    # Define distribution strategy (for working with multiple GPUs).
+    # This must be done before any other TensorFlow operations are performed.
+    strategy = {
+        'default': tf.distribute.get_strategy(),
+        'mirrored': tf.distribute.MirroredStrategy(),
+        'multiworkermirrored': tf.distribute.MultiWorkerMirroredStrategy()
+    }[args.strategy]
+    print(f'Using {args.strategy} distribution strategy.')
 
     # Plotting settings
     n_stars_plot = 1024*8
@@ -1471,6 +1714,7 @@ def main():
         mock_modes = mock_options.pop('n_modes')
         n_stars = mock_options.pop('n_stars')
         sigma_A_mock = mock_options.get('sigma_A', 0.05)
+        sigma_r_mock = mock_options.get('sigma_r', 0.05)
 
         res = gen_mock_data(
             mock_modes, star_extent, box_extent, n_stars,
@@ -1478,22 +1722,29 @@ def main():
             sigma_lnrho=mock_options.get('sigma_lnrho',1.0),
             gamma=mock_options.get('gamma', 3.6),
             sigma_A=sigma_A_mock,
+            sigma_r=sigma_r_mock,
             seed=args.mock
         )
 
         A_obs = res['A_obs']
         A_err = res['A_err']
         x_star = res['x_star']
+        if args.use_dist_err:
+            x_obs = res['x_obs']
+            d_err = res['d_err']
+        else:
+            x_obs = x_star
         log_rho_true = res['log_rho']
         A_true = res['A']
 
-        print('Plotting mock data ...')
-        ln_rho_img_true, ln_rho_intz_img_true = plot_dust_and_stars(
-            log_rho_true, x_star, A_obs, A_err,
-            box_extent, star_extent,
-            fig_dir=fig_dir, fn_suffix='_mock',
-            title='true'
-        )
+        if not args.omit_plots:
+            print('Plotting mock data ...')
+            ln_rho_img_true, ln_rho_intz_img_true = plot_dust_and_stars(
+                log_rho_true, x_star, A_obs, A_err,
+                box_extent, star_extent,
+                fig_dir=fig_dir, fn_suffix='_mock',
+                title='true'
+            )
     else:
         # Load input data
         data_fn = args.input
@@ -1505,6 +1756,8 @@ def main():
         A_obs = t['E'].data.astype('f4')
         A_err = t['sigma_E'].data.astype('f4')
         x_star = t['xyz'].data.astype('f4')
+        if args.use_dist_err:
+            d_err = t['sigma_r'].data.astype('f4')
         n_stars = len(A_obs)
         print(f'Loaded {n_stars} sources.')
 
@@ -1520,15 +1773,11 @@ def main():
         ln_rho_img_true = None
         ln_rho_intz_img_true = None
 
-    dataset = tf.data.Dataset.from_tensor_slices((A_obs,A_err,x_star))
-
-    # Define distribution strategy (for working with multiple GPUs)
-    strategy = {
-        'default': tf.distribute.get_strategy(),
-        'mirrored': tf.distribute.MirroredStrategy(),
-        'multiworkermirrored': tf.distribute.MultiWorkerMirroredStrategy()
-    }[args.strategy]
-    print(f'Using {args.strategy} distribution strategy.')
+    # Take distance uncertainties into account?
+    if args.use_dist_err:
+        dataset = tf.data.Dataset.from_tensor_slices((A_obs,A_err,d_err,x_star))
+    else:
+        dataset = tf.data.Dataset.from_tensor_slices((A_obs,A_err,x_star))
 
     log_rho_old = None
     options = options['training_rounds']
@@ -1578,6 +1827,7 @@ def main():
             history = train(
                 log_rho_fit, dataset,
                 n_stars, batch_size, n_epochs,
+                use_dist_err=args.use_dist_err,
                 checkpoint_name='log_rho',
                 checkpoint_dir=checkpoint_dir,
                 **opts
@@ -1590,15 +1840,16 @@ def main():
         fig.savefig(os.path.join(fig_dir, f'loss_history_{train_round}'))
         plt.close(fig)
 
-        plot_dust_and_stars(
-            log_rho_fit, x_star, A_obs, A_err,
-            box_extent, star_extent,
-            log_rho_true=log_rho_true,
-            ln_rho_img_true=ln_rho_img_true,
-            ln_rho_intz_img_true=ln_rho_intz_img_true,
-            fig_dir=fig_dir, fn_suffix=f'_{train_round}',
-            title='predicted'
-        )
+        if not args.omit_plots:
+            plot_dust_and_stars(
+                log_rho_fit, x_star, A_obs, A_err,
+                box_extent, star_extent,
+                log_rho_true=log_rho_true,
+                ln_rho_img_true=ln_rho_img_true,
+                ln_rho_intz_img_true=ln_rho_intz_img_true,
+                fig_dir=fig_dir, fn_suffix=f'_{train_round}',
+                title='predicted'
+            )
 
     return 0
 
