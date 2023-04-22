@@ -767,7 +767,6 @@ def train(log_rho_fit, dataset,
           n_stars, batch_size, n_epochs,
           lr0=1e-3, lr1=1e-6, n_lr_drops=9,
           log_w0=-2, log_w1=-3,
-          gamma0=3.6, gamma1=3.6,
           use_dist_err=False,
           chi2_outlier=25.,
           rtol=1e-7,
@@ -811,13 +810,6 @@ def train(log_rho_fit, dataset,
         return tf.constant(10**log_w)
 
     prior_weight = tf.Variable(get_prior_weight(0), name='prior_weight')
-
-    # Get step-dependent penalty on high-k modes
-    def get_gamma(step):
-        g = gamma0 + step/n_steps * (gamma1-gamma0)
-        return tf.constant(g)
-
-    #gamma = tf.constant(1.8) # Slope of penalty on high-k modes
 
     # Optimizer, with staircase-exponential learning rate
     lr_schedule = keras.optimizers.schedules.ExponentialDecay(
@@ -953,8 +945,6 @@ def train(log_rho_fit, dataset,
 
         # Update the weight and slope of the power-spectrum prior
         prior_weight.assign(get_prior_weight(i))
-        gamma = get_gamma(i)
-        log_rho_fit.set_power_law_slope(-gamma)
 
         # Take a single gradient step
         loss, likelihood, prior, norm, n_eval = distributed_grad_step(
@@ -1795,7 +1785,7 @@ def main():
             log_rho_fit = FourierSeriesND(
                 n_dim, n_modes,
                 extent=box_extent,
-                power_law_slope=-opts.get('gamma0',3.5),
+                power_law_slope=-opts.pop('gamma',3.5),
                 sigma=opts.pop('sigma',1.0),
                 scale_init_sigma=0.1,
                 phase_form=False,
