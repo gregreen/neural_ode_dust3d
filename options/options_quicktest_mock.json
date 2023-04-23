@@ -1,0 +1,43 @@
+{
+  "extent": {
+    "stars": [1.0, 1.0, 0.3],
+    "box": [1.5, 1.5, 0.45]
+  },
+  "mock": {
+    "n_modes": [20, 20, 6],
+    "n_stars": 32768,
+    "mu_lnrho": -1.0,
+    "sigma_lnrho": 1.5,
+    "sigma_A": 0.05,
+    "sigma_r": 0.05,
+    "gamma": 3.5
+  },
+  "training_rounds": [
+    {
+      "n_modes": [10, 10, 3],
+      "batch_size": 1024,
+      "n_epochs": 1,
+      "lr0": 1e-2,
+      "lr1": 1e-5,
+      "n_lr_drops": 6,
+      "sigma": 1.5,
+      "gamma": 3.5,
+      "log_w0": -6.0,
+      "log_w1": -6.0,
+      "checkpoint_every": 0.5
+    },
+    {
+      "n_modes": [20, 20, 6],
+      "batch_size": 1024,
+      "n_epochs": 1,
+      "lr0": 1e-2,
+      "lr1": 1e-5,
+      "n_lr_drops": 6,
+      "sigma": 1.5,
+      "gamma": 3.5,
+      "log_w0": -6.0,
+      "log_w1": -6.0,
+      "checkpoint_every": 0.2
+    }
+  ]
+}
