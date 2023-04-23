@@ -2,6 +2,8 @@
 
 from __future__ import print_function, division
 
+import os
+
 import numpy as np
 
 import matplotlib.pyplot as plt
@@ -10,6 +12,9 @@ from matplotlib import ticker
 from matplotlib.colors import CenteredNorm
 
 import tensorflow as tf
+if os.environ.get('RUN_FUNCTIONS_EAGERLY', False):
+    print('Running all functions in eager mode.')
+    tf.config.run_functions_eagerly(True)
 
 import tensorflow.keras as keras
 import tensorflow_probability as tfp
@@ -18,7 +23,6 @@ import sonnet as snt
 
 import itertools
 from tqdm import tqdm
-import os
 import json
 from argparse import ArgumentParser
 
