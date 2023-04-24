@@ -1184,6 +1184,8 @@ def plot_sky(log_rho, dist, extent, A_reference=None,
 
 
 def plot_loss(history):
+    n_steps = len(history['loss'])
+
     fig,(ax_u,ax_l) = plt.subplots(2,1, figsize=(6,6))
 
     ax_u.plot(history['loss'], label='loss')
@@ -1208,11 +1210,11 @@ def plot_loss(history):
         ax_l.plot([], [], label=r'$\mathrm{\#\ evaluations}$') # dummy
         ax2 = ax_l.twinx()
         ax2.plot([], []) # dummy
-        ax2.plot(history['n_eval'])
+        ax2.plot(history['n_eval'], alpha=0.7)
         ax2.set_ylabel(r'$\mathrm{\#\ evaluations}$')
 
     ax_u.legend(loc='upper right')
-    ax_l.legend(loc='center right')
+    ax_l.legend(loc='center right', zorder=-1)
 
     ax_l.set_xlabel(r'$\mathrm{training\ step}$')
     ax_u.set_title(r'$\mathrm{training\ history}$')
@@ -1221,6 +1223,10 @@ def plot_loss(history):
 
     ax_u.grid('on', axis='x', alpha=0.1)
     ax_l.grid('on', axis='x', alpha=0.1)
+
+    for ax in (ax_u,ax_l):
+        ax.grid('on', axis='x', alpha=0.1)
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(n_steps//7))
 
     fig.subplots_adjust(
         top=0.94,
