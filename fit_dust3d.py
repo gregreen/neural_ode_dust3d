@@ -772,7 +772,7 @@ def train(log_rho_fit, dataset,
           lr0=1e-3, lr1=1e-6, n_lr_drops=9,
           log_w0=-2, log_w1=-3,
           use_dist_err=False,
-          chi2_outlier=25.,
+          chi2_outlier=12.25,
           rtol=1e-7,
           atol=1e-5,
           checkpoint_every=1,
@@ -1200,21 +1200,20 @@ def plot_loss(history):
     ax2.plot(history['prior'], alpha=0.5)
     ax2.set_ylabel(r'$\mathrm{prior}$')
 
-    ax_l.plot(
-        history['norm'],
-        label=r'$\left|\nabla\left(\mathrm{loss}\right)\right|$'
-    )
+    ax_l.plot(history['norm'])
     ax_l.set_ylabel(r'$\left|\nabla\left(\mathrm{loss}\right)\right|$')
 
     if 'n_eval' in history:
-        ax_l.plot([], [], label=r'$\mathrm{\#\ evaluations}$') # dummy
         ax2 = ax_l.twinx()
-        ax2.plot([], []) # dummy
-        ax2.plot(history['n_eval'], alpha=0.7)
+        ax2.plot( # dummy
+            [], [],
+            label=r'$\left|\nabla\left(\mathrm{loss}\right)\right|$'
+        )
+        ax2.plot(history['n_eval'], alpha=0.7, label=r'$\mathrm{\#\ evaluations}$')
         ax2.set_ylabel(r'$\mathrm{\#\ evaluations}$')
 
     ax_u.legend(loc='upper right')
-    ax_l.legend(loc='center right', zorder=-1)
+    ax2.legend(loc='center right') # lower plot
 
     ax_l.set_xlabel(r'$\mathrm{training\ step}$')
     ax_u.set_title(r'$\mathrm{training\ history}$')
@@ -1239,7 +1238,7 @@ def plot_loss(history):
     return fig
 
 
-def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(25.),
+def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(12.25),
                       rtol=1e-7, atol=1e-5):
     """
     Returns a function that calculates the loss of
@@ -1261,7 +1260,7 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(25.),
     # ODE solver
     solver = tfp.math.ode.DormandPrince(
         rtol=rtol, atol=atol, name='ray_integrator',
-        #max_num_steps=1000
+        #max_num_steps=10000
     )
 
     if use_dist_err:
@@ -1277,6 +1276,8 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(25.),
                   dx_ds = unit vector pointing to star
                   ds_dt = path length per unit time (t) = distance to star
                 """
+                #print('')
+                #print('============================')
                 #print('t =', t)
                 #print('AL =', AL)
                 #print('dx/ds =', dx_ds)
@@ -1333,7 +1334,7 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(25.),
             AL0 = tf.zeros((A_obs.shape[0], 2))
             #AL0 = tf.zeros_like(A_obs)
             #AL0 = tf.stack([AL0,AL0], axis=1)
-            print('AL0 =', AL0)
+            #print('AL0 =', AL0)
 
             # Solve ODE
             res = solver.solve(
@@ -1358,7 +1359,7 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(25.),
             # functions can yield slightly negative values).
             L_final = tf.clip_by_value(L_final, 0, np.inf)
             #print('A(t=1) =', A_final)
-            print('L(t=1) =', L_final)
+            #print('L(t=1) =', L_final)
 
             # Calculate loss from L and prior
             lnL = tf.math.log(L_final) - tf.math.log(A_err*d_err)
@@ -1381,13 +1382,13 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(25.),
             #if np.any(idx):
             #    print('  clipped lnL =', lnL.numpy()[idx])
             #print(f'{n_above_min} stars above minimum likelihood.')
-            print('ln(L) =', lnL)
+            #print('ln(L) =', lnL)
             #idx = ~np.isfinite(lnL.numpy())
             #if np.any(idx):
             #    print('Non-finite lnL!')
             #    print('  lnL =', lnL.numpy()[idx])
             likelihood = -2 * tf.reduce_mean(lnL)
-            print('likelihood =', likelihood)
+            #print('likelihood =', likelihood)
             prior = log_rho_model.prior()
             loss = likelihood + prior_weight * prior
 
