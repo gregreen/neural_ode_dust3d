@@ -1260,26 +1260,26 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(12.25),
     # ODE solver
     solver = tfp.math.ode.DormandPrince(
         rtol=rtol, atol=atol, name='ray_integrator',
-        #max_num_steps=10000
+        #max_num_steps=1000
     )
 
     if use_dist_err:
         def calc_loss(A_obs, A_err, d_obs, d_err,
                       dx_ds, ds_dt, log_rho_model,
                       prior_weight=tf.constant(1e-3),
-                      lnL_outlier=tf.constant(-50.)):
-            def ode(t, AL, dx_ds, ds_dt, d_obs, d_err, A_obs, A_err):
+                      lnL_outlier=tf.constant(-5.)):
+            def ode(t, AlnL, dx_ds, ds_dt, d_obs, d_err, A_obs, A_err):
                 r"""
-                Calculates d(A,L)/dt along the ray.
+                Calculates d(A,lnL)/dt along the ray.
                   t = fractional distance along ray
-                  AL = (A, L) = (extinction, likelihood) = ODE state
+                  AlnL = (A, lnL) = (extinction, log likelihood) = ODE state
                   dx_ds = unit vector pointing to star
                   ds_dt = path length per unit time (t) = distance to star
                 """
                 #print('')
                 #print('============================')
                 #print('t =', t)
-                #print('AL =', AL)
+                #print('AlnL =', AlnL)
                 #print('dx/ds =', dx_ds)
                 #print('ds/dt =', ds_dt)
                 #print('d_obs =', d_obs)
@@ -1287,23 +1287,18 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(12.25),
                 #print('A_obs =', A_obs)
                 #print('A_err =', A_err)
 
-                A_t,L_t = tf.split(AL, [1,1], axis=1)
+                A_t,lnL_t = tf.split(AlnL, [1,1], axis=1)
                 A_t = tf.squeeze(A_t, axis=1)
-                #print('A(t) =', A_t)
-                L_t = tf.squeeze(L_t, axis=1)
-                #print('L(t) =', L_t)
+                lnL_t = tf.squeeze(lnL_t, axis=1)
 
                 # Current position and distance
                 d = t * ds_dt
                 x = dx_ds * d
-                #print('x =', x)
                 d = tf.squeeze(d, axis=1)
-                #print('d =', d)
 
                 # dA/ds = rho(x(s))
                 dA_ds = tf.math.exp(log_rho_model(x))
                 dA_ds = tf.squeeze(dA_ds, axis=1)
-                #print('dA/ds =', dA_ds)
 
                 # dL/ds = N(A|A_obs,A_err) * N(d|d_obs,d_err)
                 chi2 = (
@@ -1313,33 +1308,56 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(12.25),
                 chi2 = (
                     chi2_outlier * tf.math.asinh(chi2/chi2_outlier)
                 )
-                dL_ds = tf.math.exp(-0.5*chi2)
+                ln_dL_ds = -0.5 * chi2
+
+                # Convert dL/ds to dlnL/ds:
+                #   dlnL/ds = 1/L dL/ds = exp(ln(dL/ds) - ln(L))
+                # It is critical that we prevent ln(L) from going to -inf!
+                # During reverse integration (from t = 1 to t = 0), ln(L)
+                # can diverge towards -inf, causing dlnL/ds to diverge
+                # towards inf, causing the integrator to stall.
+                lnL_t = tf.maximum(lnL_t, -25.)
+                dlnL_ds = tf.math.exp(ln_dL_ds - lnL_t)
 
                 #dL_ds = tf.math.exp(-0.5 * (
                 #    ((d_obs-d)/d_err)**2
                 #  + ((A_obs-A_t)/A_err)**2
                 #))
-                #print('dL/ds =', dL_ds)
                 
-                # d(A,L)/dt = ds/dt * d(A,L)/ds
-                dAL_dt = ds_dt * tf.stack([dA_ds,dL_ds], axis=1)
-                #print('d(AL)/dt =', dAL_dt)
+                # d(A,lnL)/dt = ds/dt * d(A,lnL)/ds
+                dAlnL_dt = ds_dt * tf.stack([dA_ds,dlnL_ds], axis=1)
+
+                #tf.print('t =', t)
+                #tf.print('min(chi2):', tf.reduce_min(chi2))
+                #tf.print('max(chi2):', tf.reduce_max(chi2))
+                #tf.print('mean(chi2):', tf.reduce_mean(chi2))
+                #tf.print('min(lnL_t):', tf.reduce_min(lnL_t))
+                #tf.print('max(lnL_t):', tf.reduce_max(lnL_t))
+                #tf.print('mean(lnL_t):', tf.reduce_mean(lnL_t))
+                #tf.print('min(dlnL_ds):', tf.reduce_min(lnL_t))
+                #tf.print('max(dlnL_ds):', tf.reduce_max(lnL_t))
+                #tf.print('mean(dlnL_ds):', tf.reduce_mean(lnL_t))
+                #tf.print('')
 
                 #if np.any(~np.isfinite(t.numpy())):
                 #    return None
 
-                return dAL_dt
+                return dAlnL_dt
 
-            # Initial state: (A,L) = (0,0)
-            AL0 = tf.zeros((A_obs.shape[0], 2))
-            #AL0 = tf.zeros_like(A_obs)
-            #AL0 = tf.stack([AL0,AL0], axis=1)
-            #print('AL0 =', AL0)
+            # Normalization factor for L
+            lnL_norm = tf.math.log(A_err*d_err)
+
+            # Initial state: (A,lnL) = (0, ln(epsilon))
+            AlnL0 = tf.zeros((A_obs.shape[0], 1))
+            A0 = tf.zeros(A_obs.shape[0], 1)
+            lnL0 = lnL_norm + lnL_outlier# * tf.ones(A_obs.shape[0], 1)
+            AlnL0 = tf.stack([A0,lnL0], axis=1)
+            #print('AlnL0 =', AlnL0)
 
             # Solve ODE
             res = solver.solve(
                 ode,
-                0, AL0,
+                0, AlnL0,
                 tf.constant([1]),
                 constants={
                     'dx_ds':dx_ds, 'ds_dt':ds_dt,
@@ -1348,21 +1366,18 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(12.25),
                 }
             )
 
-            # Extract (A,L) as distance -> infinity
-            AL_final = tf.squeeze(res.states, axis=0)
-            #print('AL(t=1) =', AL_final)
-            A_final,L_final = tf.split(AL_final, [1,1], axis=1)
+            # Extract (A,lnL) as distance -> infinity
+            AlnL_final = tf.squeeze(res.states, axis=0)
+            #print('AlnL(t=1) =', AlnL_final)
+            A_final,lnL_final = tf.split(AlnL_final, [1,1], axis=1)
             A_final = tf.squeeze(A_final, axis=1)
-            L_final = tf.squeeze(L_final, axis=1)
+            lnL_final = tf.squeeze(lnL_final, axis=1)
 
-            # Require L >= 0 (numerical integration of strictly positive
-            # functions can yield slightly negative values).
-            L_final = tf.clip_by_value(L_final, 0, np.inf)
-            #print('A(t=1) =', A_final)
-            #print('L(t=1) =', L_final)
+            #tf.print('AlnL_final =', AlnL_final)
 
-            # Calculate loss from L and prior
-            lnL = tf.math.log(L_final) - tf.math.log(A_err*d_err)
+            # Add in normalization term to ln(L), from observational errors
+            lnL = lnL_final - lnL_norm
+            #tf.print('lnL =', lnL)
             #idx = np.isnan(lnL.numpy())
             #if np.any(idx):
             #    print('NaN lnL!')
@@ -1374,7 +1389,7 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(12.25),
 
             # Add in floor on L (using stable addition method, similar to
             # tf.math.reduce_logsumexp)
-            lnL = tfp.math.log_add_exp(lnL, lnL_outlier)
+            #lnL = tfp.math.log_add_exp(lnL, lnL_outlier)
             #lnL0 = tf.minimum(lnL, lnL_outlier)
             #lnL1 = tf.maximum(lnL, lnL_outlier)
             #lnL = lnL1 + tf.math.log(1 + tf.math.exp(lnL0-lnL1))
