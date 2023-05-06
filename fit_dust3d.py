@@ -21,6 +21,8 @@ import tensorflow_probability as tfp
 import tensorflow_addons as tfa
 import sonnet as snt
 
+import scipy.ndimage
+
 import itertools
 from tqdm import tqdm
 import json
@@ -1186,12 +1188,48 @@ def plot_sky(log_rho, dist, extent, A_reference=None,
 def plot_loss(history):
     n_steps = len(history['loss'])
 
-    fig,(ax_u,ax_l) = plt.subplots(2,1, figsize=(6,6))
+    # Functions to smooth and plot time series
+    def smooth_time_series(x):
+        n_smooth = np.clip(len(x)//16, 4, 128)
+        w = np.kaiser(2*n_smooth,5)
+        w /= np.sum(w)
+        x_conv = scipy.ndimage.convolve(x, w, mode='reflect')
+        return x_conv
 
-    ax_u.plot(history['loss'], label='loss')
-    ax_u.plot(history['likelihood'], alpha=0.5, label='likelihood')
+    def plot_smoothed(ax, x, label=None, truncate=None):
+        x_s = smooth_time_series(x)
+        t = np.arange(len(x))
+        if truncate is not None:
+            x_s = x_s[truncate]
+            x = x[truncate]
+            t = t[truncate]
+        l, = ax.plot(t, x_s, label=label)
+        ax.plot(t, x, alpha=0.3, color=l.get_color())
 
-    ax_u.plot([], [], alpha=0.5, label='prior') # dummy plot, for legend
+    fig = plt.figure(figsize=(8,4))
+
+    gs = fig.add_gridspec(2, 2)
+    ax_u = fig.add_subplot(gs[0,0])
+    ax_l = fig.add_subplot(gs[1,0])
+    ax_r = fig.add_subplot(gs[:,1])
+
+    plot_smoothed(ax_u, history['loss'], label=r'$\mathrm{loss}$')
+    plot_smoothed(ax_u, history['likelihood'], label=r'$\mathrm{likelihood}$')
+
+    plot_smoothed(
+        ax_r, history['loss'],
+        truncate=slice(n_steps//2, n_steps),
+        label=r'$\mathrm{loss}$'
+    )
+    plot_smoothed(
+        ax_r, history['likelihood'],
+        truncate=slice(n_steps//2, n_steps),
+        label=r'$\mathrm{likelihood}$'
+    )
+
+    # Dummy plot, for legend
+    ax_u.plot([], [], alpha=0.5, label=r'$\mathrm{prior}$')
+
     ax_u.set_ylabel(r'$\mathrm{loss}$, $\mathrm{likelihood}$')
 
     ax2 = ax_u.twinx()
@@ -1200,7 +1238,8 @@ def plot_loss(history):
     ax2.plot(history['prior'], alpha=0.5)
     ax2.set_ylabel(r'$\mathrm{prior}$')
 
-    ax_l.plot(history['norm'])
+    plot_smoothed(ax_l, history['norm'])
+    ax_l.set_yscale('log')
     ax_l.set_ylabel(r'$\left|\nabla\left(\mathrm{loss}\right)\right|$')
 
     if 'n_eval' in history:
@@ -1209,30 +1248,42 @@ def plot_loss(history):
             [], [],
             label=r'$\left|\nabla\left(\mathrm{loss}\right)\right|$'
         )
-        ax2.plot(history['n_eval'], alpha=0.7, label=r'$\mathrm{\#\ evaluations}$')
+        plot_smoothed(
+            ax2, history['n_eval'],
+            label=r'$\mathrm{\#\ evaluations}$'
+        )
         ax2.set_ylabel(r'$\mathrm{\#\ evaluations}$')
 
     ax_u.legend(loc='upper right')
-    ax2.legend(loc='center right') # lower plot
+    ax2.legend(loc='upper right') # lower plot
 
     ax_l.set_xlabel(r'$\mathrm{training\ step}$')
-    ax_u.set_title(r'$\mathrm{training\ history}$')
+    ax_u.set_title(r'$\mathrm{full\ training\ history}$')
+
+    ax_r.set_xlabel(r'$\mathrm{training\ step}$')
+    ax_r.set_title(r'$\mathrm{2^{nd}\ half\ of\ training\ history}$')
+    ax_r.set_ylabel(r'$\mathrm{loss}$, $\mathrm{likelihood}$')
 
     ax_u.set_xticklabels([])
 
-    ax_u.grid('on', axis='x', alpha=0.1)
-    ax_l.grid('on', axis='x', alpha=0.1)
-
     for ax in (ax_u,ax_l):
         ax.grid('on', axis='x', alpha=0.1)
-        ax.xaxis.set_major_locator(ticker.MultipleLocator(n_steps//7))
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(n_steps//4))
+        ax.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+
+    ax_r.xaxis.set_major_locator(ticker.MultipleLocator(n_steps//8))
+    ax_r.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+    ax_r.yaxis.set_minor_locator(ticker.AutoMinorLocator())
+    ax_r.grid('on', which='major', alpha=0.2)
+    ax_r.grid('on', which='minor', alpha=0.05)
 
     fig.subplots_adjust(
-        top=0.94,
-        bottom=0.10,
-        left=0.14,
-        right=0.86,
-        hspace=0.05
+        top=0.92,
+        bottom=0.13,
+        left=0.08,
+        right=0.98,
+        hspace=0.08,
+        wspace=0.45
     )
 
     return fig
