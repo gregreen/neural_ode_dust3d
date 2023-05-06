@@ -1267,7 +1267,7 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(12.25),
         def calc_loss(A_obs, A_err, d_obs, d_err,
                       dx_ds, ds_dt, log_rho_model,
                       prior_weight=tf.constant(1e-3),
-                      lnL_outlier=tf.constant(-50.)):
+                      lnL_outlier=tf.constant(-25.)):
             def ode(t, AL, dx_ds, ds_dt, d_obs, d_err, A_obs, A_err):
                 r"""
                 Calculates d(A,L)/dt along the ray.
@@ -1331,9 +1331,12 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(12.25),
                 return dAL_dt
 
             # Initial state: (A,L) = (0,0)
-            AL0 = tf.zeros((A_obs.shape[0], 2))
+            #AL0 = tf.zeros((A_obs.shape[0], 2))
+            L_outlier = tf.math.exp(lnL_outlier)
+            A0 = tf.zeros([A_obs.shape[0]])
+            L0 = tf.ones([A_obs.shape[0]]) * L_outlier
             #AL0 = tf.zeros_like(A_obs)
-            #AL0 = tf.stack([AL0,AL0], axis=1)
+            AL0 = tf.stack([A0,L0], axis=1)
             #print('AL0 =', AL0)
 
             # Solve ODE
@@ -1357,7 +1360,7 @@ def get_loss_function(use_dist_err=False, chi2_outlier=tf.constant(12.25),
 
             # Require L >= 0 (numerical integration of strictly positive
             # functions can yield slightly negative values).
-            L_final = tf.clip_by_value(L_final, 0, np.inf)
+            L_final = tf.clip_by_value(L_final, L_outlier, np.inf)
             #print('A(t=1) =', A_final)
             #print('L(t=1) =', L_final)
 
